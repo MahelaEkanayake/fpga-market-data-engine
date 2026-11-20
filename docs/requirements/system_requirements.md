@@ -12,39 +12,21 @@ Engine\
 
 ## Document Control
 
-  -----------------------------------------------------------------------
-  Item                                Description
-  ----------------------------------- -----------------------------------
-  Project type                        FPGA-based market-data processing
-                                      prototype
-
-  Primary target                      Arty Z7-20 / Zynq-7020
-
-  Processing partition                FPGA Programmable Logic (PL) with
-                                      ARM Cortex-A9 Processing System
-                                      (PS)
-
-  Initial instrument count            One
-
-  Initial order capacity              1,024 outstanding orders
-
-  Requirements status                 Provisional; protocol and
-                                      architecture decisions remain open
-  -----------------------------------------------------------------------
+| Item | Description |
+| --- | --- |
+| Project type | FPGA-based market-data processing prototype |
+| Primary target | Arty Z7-20 / Zynq-7020 |
+| Processing partition | FPGA Programmable Logic (PL) with ARM Cortex-A9 Processing System (PS) |
+| Initial instrument count | One |
+| Initial order capacity | 1,024 outstanding orders |
+| Requirements status | Provisional; protocol and architecture decisions remain open |
 
 ### Revision History
 
-  -----------------------------------------------------------------------
-  Version                             Description
-  ----------------------------------- -----------------------------------
-  0.1                                 Initial engineering requirements
-
-  0.2                                 Clarified project boundaries, event
-                                      semantics, analytics, data
-                                      integrity, recovery, host
-                                      interface, observability, and
-                                      verification requirements
-  -----------------------------------------------------------------------
+| Version | Description |
+| --- | --- |
+| 0.1 | Initial engineering requirements |
+| 0.2 | Clarified project boundaries, event semantics, analytics, data integrity, recovery, host interface, observability, and verification requirements |
 
 ------------------------------------------------------------------------
 
@@ -182,31 +164,13 @@ functionality is outside this project's scope.
 The internal event model will initially include the following event
 categories:
 
-  -----------------------------------------------------------------------
-  Event                   Purpose                 Required effect on the
-                                                  order book
-  ----------------------- ----------------------- -----------------------
-  `ADD`                   Introduces a new order  Create an active order
-                                                  with an ID, side,
-                                                  price, and quantity
-
-  `CANCEL`                Cancels all or part of  Reduce remaining
-                          an existing order       quantity or remove the
-                                                  order
-
-  `MODIFY`                Changes attributes of   Apply the
-                          an existing order       protocol-defined
-                                                  modification rules
-
-  `EXECUTE`               Reports execution       Reduce the order's
-                          against an existing     remaining quantity
-                          order                   
-
-  `TRADE`                 Reports trade           Update trade statistics
-                          information             when the event is
-                                                  authoritative and
-                                                  applicable
-  -----------------------------------------------------------------------
+| Event | Purpose | Required effect on the order book |
+| --- | --- | --- |
+| `ADD` | Introduces a new order | Create an active order with an ID, side, price, and quantity |
+| `CANCEL` | Cancels all or part of an existing order | Reduce remaining quantity or remove the order |
+| `MODIFY` | Changes attributes of an existing order | Apply the protocol-defined modification rules |
+| `EXECUTE` | Reports execution against an existing order | Reduce the order's remaining quantity |
+| `TRADE` | Reports trade information | Update trade statistics when the event is authoritative and applicable |
 
 The exact meaning of each event must be defined by the selected
 market-data protocol. In particular, `EXECUTE` and `TRADE` must not
@@ -224,31 +188,16 @@ before RTL implementation.
 The internal event format is expected to contain some or all of the
 following fields:
 
-  -----------------------------------------------------------------------
-  Field                               Purpose
-  ----------------------------------- -----------------------------------
-  Event type                          Identifies ADD, CANCEL, MODIFY,
-                                      EXECUTE, or TRADE
-
-  Instrument identifier               Identifies the instrument; may be
-                                      implicit in the single-instrument
-                                      prototype
-
-  Order ID                            Identifies an individual order
-
-  Side                                BUY or SELL, where applicable
-
-  Price                               Order or trade price, where
-                                      applicable
-
-  Quantity                            Event quantity
-
-  Sequence number                     Identifies the event's position in
-                                      the feed, if provided
-
-  Timestamp                           Source or local timestamp, if
-                                      required for measurement
-  -----------------------------------------------------------------------
+| Field | Purpose |
+| --- | --- |
+| Event type | Identifies ADD, CANCEL, MODIFY, EXECUTE, or TRADE |
+| Instrument identifier | Identifies the instrument; may be implicit in the single-instrument prototype |
+| Order ID | Identifies an individual order |
+| Side | BUY or SELL, where applicable |
+| Price | Order or trade price, where applicable |
+| Quantity | Event quantity |
+| Sequence number | Identifies the event's position in the feed, if provided |
+| Timestamp | Source or local timestamp, if required for measurement |
 
 Field widths, signedness, price representation, quantity units, optional
 fields, and invalid encodings will be defined in
@@ -288,43 +237,19 @@ encoding.
 The system shall make the following information available to the host
 processor.
 
-  -----------------------------------------------------------------------
-  Output                              Description
-  ----------------------------------- -----------------------------------
-  Order-book state                    Current active orders on the buy
-                                      and sell sides
-
-  Best bid                            Highest active buy price
-
-  Best ask                            Lowest active sell price
-
-  Spread                              Best ask minus best bid, when both
-                                      sides are non-empty
-
-  Market depth                        Aggregated remaining quantity at
-                                      selected price levels
-
-  Trade information                   Trade price, quantity, and derived
-                                      statistics where supported by the
-                                      feed mapping
-
-  Order imbalance                     A defined comparison of bid-side
-                                      and ask-side quantities
-
-  VWAP                                Volume-weighted average execution
-                                      price over a defined measurement
-                                      interval
-
-  Event status                        Accepted, rejected, or error status
-                                      for processed events
-
-  Feed status                         Sequence continuity and order-book
-                                      validity status
-
-  Performance counters                Event counts, FIFO status,
-                                      occupancy, and measured processing
-                                      statistics
-  -----------------------------------------------------------------------
+| Output | Description |
+| --- | --- |
+| Order-book state | Current active orders on the buy and sell sides |
+| Best bid | Highest active buy price |
+| Best ask | Lowest active sell price |
+| Spread | Best ask minus best bid, when both sides are non-empty |
+| Market depth | Aggregated remaining quantity at selected price levels |
+| Trade information | Trade price, quantity, and derived statistics where supported by the feed mapping |
+| Order imbalance | A defined comparison of bid-side and ask-side quantities |
+| VWAP | Volume-weighted average execution price over a defined measurement interval |
+| Event status | Accepted, rejected, or error status for processed events |
+| Feed status | Sequence continuity and order-book validity status |
+| Performance counters | Event counts, FIFO status, occupancy, and measured processing statistics |
 
 The exact host-access mechanism and register/data layout will be
 specified in the hardware architecture and interface documents.
@@ -339,73 +264,29 @@ confirmation in the Market Data Protocol Specification.
 
 ## 5.1 Event Ingress and Validation
 
-  -----------------------------------------------------------------------
-  ID                                  Requirement
-  ----------------------------------- -----------------------------------
-  FR-01                               The system shall accept market-data
-                                      events through the defined input
-                                      interface.
-
-  FR-02                               The system shall buffer incoming
-                                      events before processing where
-                                      required by the architecture.
-
-  FR-03                               The system shall decode and
-                                      classify each received event.
-
-  FR-04                               The system shall validate event
-                                      type, required fields, and field
-                                      ranges before applying an event.
-
-  FR-05                               The system shall detect duplicate
-                                      active order IDs on an ADD event.
-
-  FR-06                               The system shall detect CANCEL,
-                                      MODIFY, or EXECUTE events that
-                                      reference nonexistent orders.
-
-  FR-07                               The system shall reject invalid
-                                      events without corrupting the
-                                      existing order-book state.
-  -----------------------------------------------------------------------
+| ID | Requirement |
+| --- | --- |
+| FR-01 | The system shall accept market-data events through the defined input interface. |
+| FR-02 | The system shall buffer incoming events before processing where required by the architecture. |
+| FR-03 | The system shall decode and classify each received event. |
+| FR-04 | The system shall validate event type, required fields, and field ranges before applying an event. |
+| FR-05 | The system shall detect duplicate active order IDs on an ADD event. |
+| FR-06 | The system shall detect CANCEL, MODIFY, or EXECUTE events that reference nonexistent orders. |
+| FR-07 | The system shall reject invalid events without corrupting the existing order-book state. |
 
 ## 5.2 Order-Book Management
 
-  -----------------------------------------------------------------------
-  ID                                  Requirement
-  ----------------------------------- -----------------------------------
-  FR-08                               The system shall maintain separate
-                                      BUY and SELL order collections.
-
-  FR-09                               The system shall add valid orders
-                                      to the order book.
-
-  FR-10                               The system shall locate active
-                                      orders using their order IDs.
-
-  FR-11                               The system shall support full and
-                                      partial cancellation, subject to
-                                      the selected event semantics.
-
-  FR-12                               The system shall apply valid order
-                                      modifications according to the
-                                      selected feed rules.
-
-  FR-13                               The system shall reduce remaining
-                                      order quantity when a valid
-                                      execution is applied.
-
-  FR-14                               The system shall remove an order
-                                      from the active book when its
-                                      remaining quantity reaches zero.
-
-  FR-15                               The system shall maintain price
-                                      ordering on each side of the book.
-
-  FR-16                               The system shall preserve the
-                                      applicable time ordering of orders
-                                      at the same price level.
-  -----------------------------------------------------------------------
+| ID | Requirement |
+| --- | --- |
+| FR-08 | The system shall maintain separate BUY and SELL order collections. |
+| FR-09 | The system shall add valid orders to the order book. |
+| FR-10 | The system shall locate active orders using their order IDs. |
+| FR-11 | The system shall support full and partial cancellation, subject to the selected event semantics. |
+| FR-12 | The system shall apply valid order modifications according to the selected feed rules. |
+| FR-13 | The system shall reduce remaining order quantity when a valid execution is applied. |
+| FR-14 | The system shall remove an order from the active book when its remaining quantity reaches zero. |
+| FR-15 | The system shall maintain price ordering on each side of the book. |
+| FR-16 | The system shall preserve the applicable time ordering of orders at the same price level. |
 
 Price-time priority in this document describes how orders are
 represented and ordered in the reconstructed book. It does not imply
@@ -413,42 +294,16 @@ that the prototype performs trade matching.
 
 ## 5.3 Market Analytics
 
-  -----------------------------------------------------------------------
-  ID                                  Requirement
-  ----------------------------------- -----------------------------------
-  FR-17                               The system shall calculate the best
-                                      bid from active BUY orders.
-
-  FR-18                               The system shall calculate the best
-                                      ask from active SELL orders.
-
-  FR-19                               The system shall calculate the
-                                      bid-ask spread when both sides
-                                      contain at least one active order.
-
-  FR-20                               The system shall calculate market
-                                      depth by aggregating remaining
-                                      quantity at price levels.
-
-  FR-21                               The system shall maintain
-                                      executed-volume statistics using
-                                      the authoritative execution/trade
-                                      event mapping.
-
-  FR-22                               The system shall calculate VWAP
-                                      over a defined measurement interval
-                                      using executed trades, not
-                                      outstanding order quantities.
-
-  FR-23                               The system shall calculate
-                                      order-book imbalance using a
-                                      defined set of bid and ask depth
-                                      levels.
-
-  FR-24                               The system shall make the selected
-                                      analytics available to the host
-                                      processor.
-  -----------------------------------------------------------------------
+| ID | Requirement |
+| --- | --- |
+| FR-17 | The system shall calculate the best bid from active BUY orders. |
+| FR-18 | The system shall calculate the best ask from active SELL orders. |
+| FR-19 | The system shall calculate the bid-ask spread when both sides contain at least one active order. |
+| FR-20 | The system shall calculate market depth by aggregating remaining quantity at price levels. |
+| FR-21 | The system shall maintain executed-volume statistics using the authoritative execution/trade event mapping. |
+| FR-22 | The system shall calculate VWAP over a defined measurement interval using executed trades, not outstanding order quantities. |
+| FR-23 | The system shall calculate order-book imbalance using a defined set of bid and ask depth levels. |
+| FR-24 | The system shall make the selected analytics available to the host processor. |
 
 The formulas, depth window, reset behaviour, numeric precision, and
 measurement interval for FR-20 to FR-23 must be finalized in the
@@ -460,61 +315,24 @@ Division-by-zero behaviour must also be specified.
 
 ## 5.4 Host Interface and Control
 
-  -----------------------------------------------------------------------
-  ID                                  Requirement
-  ----------------------------------- -----------------------------------
-  FR-25                               The host processor shall be able to
-                                      read system status and order-book
-                                      validity.
-
-  FR-26                               The host processor shall be able to
-                                      read the supported analytics and
-                                      performance counters.
-
-  FR-27                               The host processor shall be able to
-                                      configure supported operating
-                                      parameters.
-
-  FR-28                               The system shall provide a defined
-                                      reset and initialization sequence.
-
-  FR-29                               The system shall expose error and
-                                      feed-discontinuity status to the
-                                      host processor.
-  -----------------------------------------------------------------------
+| ID | Requirement |
+| --- | --- |
+| FR-25 | The host processor shall be able to read system status and order-book validity. |
+| FR-26 | The host processor shall be able to read the supported analytics and performance counters. |
+| FR-27 | The host processor shall be able to configure supported operating parameters. |
+| FR-28 | The system shall provide a defined reset and initialization sequence. |
+| FR-29 | The system shall expose error and feed-discontinuity status to the host processor. |
 
 ## 5.5 Event Sequencing and Recovery
 
-  -----------------------------------------------------------------------
-  ID                                  Requirement
-  ----------------------------------- -----------------------------------
-  FR-30                               Where sequence numbers are
-                                      supplied, the system shall check
-                                      incoming event sequence continuity.
-
-  FR-31                               The system shall detect a missing,
-                                      duplicate, or unexpected sequence
-                                      number according to the configured
-                                      sequence rules.
-
-  FR-32                               When a sequence discontinuity makes
-                                      the reconstructed state unreliable,
-                                      the system shall mark the order
-                                      book invalid.
-
-  FR-33                               The system shall not silently
-                                      continue to report an incomplete
-                                      order book as valid.
-
-  FR-34                               The system shall expose the
-                                      recovery-required condition to the
-                                      host processor.
-
-  FR-35                               The system shall support a defined
-                                      recovery procedure, initially based
-                                      on reset and replay or
-                                      snapshot-based reinitialization.
-  -----------------------------------------------------------------------
+| ID | Requirement |
+| --- | --- |
+| FR-30 | Where sequence numbers are supplied, the system shall check incoming event sequence continuity. |
+| FR-31 | The system shall detect a missing, duplicate, or unexpected sequence number according to the configured sequence rules. |
+| FR-32 | When a sequence discontinuity makes the reconstructed state unreliable, the system shall mark the order book invalid. |
+| FR-33 | The system shall not silently continue to report an incomplete order book as valid. |
+| FR-34 | The system shall expose the recovery-required condition to the host processor. |
+| FR-35 | The system shall support a defined recovery procedure, initially based on reset and replay or snapshot-based reinitialization. |
 
 The exact sequence-number width, wraparound behaviour, duplicate
 handling, snapshot format, and replay procedure depend on the selected
@@ -638,22 +456,16 @@ goals. They must be validated against the selected order-book data
 structure, FPGA resource capacity, memory access pattern, and
 host-interface overhead.
 
-  -----------------------------------------------------------------------
-  Parameter                      Initial Target            Stretch Target
-  ------------------- ------------------------- -------------------------
-  Sustained event            1 million events/s       10 million events/s
-  throughput                                    
-
-  Outstanding orders                      1,024                     4,096
-
-  FPGA clock                            100 MHz       200 MHz, subject to
-  frequency                                                timing closure
-
-  Processing latency   Measure and characterize Optimize and characterize
-
-  Processing               Functionally correct           Pipelined where
-  architecture                                                 beneficial
-  -----------------------------------------------------------------------
+| Parameter | Initial Target | Stretch Target |
+| --- | --- | --- |
+| Sustained event | 1 million events/s | 10 million events/s |
+| throughput |  |  |
+| Outstanding orders | 1,024 | 4,096 |
+| FPGA clock | 100 MHz | 200 MHz, subject to |
+| frequency |  | timing closure |
+| Processing latency | Measure and characterize | Optimize and characterize |
+| Processing | Functionally correct | Pipelined where |
+| architecture |  | beneficial |
 
 ## 8.1 Throughput
 
@@ -708,39 +520,19 @@ verification and performance analysis.
 
 The initial set of counters and status signals should include:
 
-  -----------------------------------------------------------------------
-  Diagnostic                          Purpose
-  ----------------------------------- -----------------------------------
-  Accepted event count                Number of events accepted for
-                                      processing
-
-  Processed event count               Number of events successfully
-                                      applied
-
-  Rejected event count                Number of invalid or unsupported
-                                      events
-
-  Event counts by type                ADD, CANCEL, MODIFY, EXECUTE, and
-                                      TRADE counts
-
-  FIFO occupancy                      Current or maximum observed
-                                      input-buffer occupancy
-
-  FIFO overflow count                 Number of overflow events
-
-  Sequence error count                Number of detected sequence
-                                      discontinuities
-
-  Active order count                  Number of currently active orders
-
-  Processing latency                  Measured event-processing latency
-
-  Order-book valid flag               Indicates whether the reconstructed
-                                      state is trusted
-
-  System ready flag                   Indicates that initialization has
-                                      completed
-  -----------------------------------------------------------------------
+| Diagnostic | Purpose |
+| --- | --- |
+| Accepted event count | Number of events accepted for processing |
+| Processed event count | Number of events successfully applied |
+| Rejected event count | Number of invalid or unsupported events |
+| Event counts by type | ADD, CANCEL, MODIFY, EXECUTE, and TRADE counts |
+| FIFO occupancy | Current or maximum observed input-buffer occupancy |
+| FIFO overflow count | Number of overflow events |
+| Sequence error count | Number of detected sequence discontinuities |
+| Active order count | Number of currently active orders |
+| Processing latency | Measured event-processing latency |
+| Order-book valid flag | Indicates whether the reconstructed state is trusted |
+| System ready flag | Indicates that initialization has completed |
 
 The final counter widths, clear-on-read or explicit-clear behaviour, and
 host register mapping will be defined in the hardware interface
@@ -750,33 +542,19 @@ specification.
 
 # 10. Target Hardware and Development Environment
 
-  -----------------------------------------------------------------------
-  Component                           Selection
-  ----------------------------------- -----------------------------------
-  FPGA board                          Digilent Arty Z7-20
-
-  FPGA device                         Xilinx Zynq-7020
-
-  RTL language                        SystemVerilog
-
-  RTL simulation                      Verilator
-
-  Waveform analysis                   GTKWave
-
-  Synthesis and implementation        Xilinx Vivado
-
-  Host processor                      ARM Cortex-A9 Processing System
-
-  On-chip memory                      Block RAM, subject to architecture
-
-  Host communication                  AXI interfaces
-
-  Event ingress for initial prototype AXI-Stream, subject to interface
-                                      design
-
-  Host control/status interface       AXI4-Lite or another suitable AXI
-                                      interface
-  -----------------------------------------------------------------------
+| Component | Selection |
+| --- | --- |
+| FPGA board | Digilent Arty Z7-20 |
+| FPGA device | Xilinx Zynq-7020 |
+| RTL language | SystemVerilog |
+| RTL simulation | Verilator |
+| Waveform analysis | GTKWave |
+| Synthesis and implementation | Xilinx Vivado |
+| Host processor | ARM Cortex-A9 Processing System |
+| On-chip memory | Block RAM, subject to architecture |
+| Host communication | AXI interfaces |
+| Event ingress for initial prototype | AXI-Stream, subject to interface design |
+| Host control/status interface | AXI4-Lite or another suitable AXI interface |
 
 The FPGA Programmable Logic is expected to perform event ingress,
 decoding, order-book updates, analytics, and performance monitoring. The
@@ -901,41 +679,18 @@ formally added through a requirements revision.
 
 # 14. Development Milestones
 
-  -----------------------------------------------------------------------
-  Milestone               Description             Expected output
-  ----------------------- ----------------------- -----------------------
-  M1                      Requirements refinement Approved system
-                                                  requirements
-
-  M2                      Market-data protocol    Protocol and internal
-                          investigation           event specification
-
-  M3                      Hardware architecture   Block diagram and
-                          design                  interface definitions
-
-  M4                      Order-book data         Data-structure and
-                          structure design        memory-access design
-
-  M5                      Software reference      Executable model and
-                          model                   test vectors
-
-  M6                      RTL implementation      Synthesizable
-                                                  SystemVerilog modules
-
-  M7                      Functional verification Self-checking
-                                                  testbenches and
-                                                  comparison results
-
-  M8                      AXI and PS-PL           Host-accessible FPGA
-                          integration             subsystem
-
-  M9                      FPGA deployment         Working implementation
-                                                  on Arty Z7-20
-
-  M10                     Performance             Measured throughput,
-                          optimization            latency, and resource
-                                                  report
-  -----------------------------------------------------------------------
+| Milestone | Description | Expected output |
+| --- | --- | --- |
+| M1 | Requirements refinement | Approved system requirements |
+| M2 | Market-data protocol investigation | Protocol and internal event specification |
+| M3 | Hardware architecture design | Block diagram and interface definitions |
+| M4 | Order-book data structure design | Data-structure and memory-access design |
+| M5 | Software reference model | Executable model and test vectors |
+| M6 | RTL implementation | Synthesizable SystemVerilog modules |
+| M7 | Functional verification | Self-checking testbenches and comparison results |
+| M8 | AXI and PS-PL integration | Host-accessible FPGA subsystem |
+| M9 | FPGA deployment | Working implementation on Arty Z7-20 |
+| M10 | Performance optimization | Measured throughput, latency, and resource report |
 
 ------------------------------------------------------------------------
 
@@ -944,69 +699,19 @@ formally added through a requirements revision.
 The following items must be resolved before the corresponding
 implementation work is finalized.
 
-  -------------------------------------------------------------------------
-  ID                Open decision     Why it matters      Planned
-                                                          resolution
-  ----------------- ----------------- ------------------- -----------------
-  OD-01             Which market-data Determines event    Protocol
-                    protocol will be  semantics,          investigation
-                    used as the       sequencing, and     
-                    reference?        field mapping       
-
-  OD-02             What is the       Prevents incorrect  Protocol
-                    authoritative     remaining           specification
-                    relationship      quantities and      
-                    between EXECUTE   double-counted      
-                    and TRADE         trades              
-                    messages?                             
-
-  OD-03             What are the      Some feeds may      Protocol
-                    exact MODIFY      treat price or      specification
-                    rules?            quantity changes as 
-                                      priority-changing   
-                                      events              
-
-  OD-04             What price and    Determines field    Internal event
-                    quantity          widths, precision,  specification
-                    representations   and arithmetic      
-                    will be used                          
-                    internally?                           
-
-  OD-05             What data         Dominates memory    Data-structure
-                    structure will    architecture and    design
-                    support order-ID  update latency      
-                    lookup and                            
-                    price-time                            
-                    ordering?                             
-
-  OD-06             How will best bid Affects update      Architecture
-                    and best ask be   complexity and      design
-                    maintained?       latency             
-
-  OD-07             What depth window Defines the         Analytics
-                    will be used for  analytics           specification
-                    market imbalance? calculation         
-
-  OD-08             What interval and Defines             Analytics
-                    reset policy will trade-statistics    specification
-                    be used for VWAP? state               
-
-  OD-09             What is the exact Determines          Interface
-                    AXI ingress and   integration and     specification
-                    host-control      backpressure        
-                    interface?        behaviour           
-
-  OD-10             What recovery     Determines          Recovery design
-                    mechanism will be behaviour after a   
-                    implemented in    feed gap            
-                    the first                             
-                    prototype?                            
-
-  OD-11             How will latency  Ensures meaningful  Verification plan
-                    be measured in    and reproducible    
-                    simulation and    performance claims  
-                    hardware?                             
-  -------------------------------------------------------------------------
+| ID | Open decision | Why it matters | Planned resolution |
+| --- | --- | --- | --- |
+| OD-01 | Which market-data protocol will be used as the reference? | Determines event semantics, sequencing, and field mapping | Protocol investigation |
+| OD-02 | What is the authoritative relationship between EXECUTE and TRADE messages? | Prevents incorrect remaining quantities and double-counted trades | Protocol specification |
+| OD-03 | What are the exact MODIFY rules? | Some feeds may treat price or quantity changes as priority-changing events | Protocol specification |
+| OD-04 | What price and quantity representations will be used internally? | Determines field widths, precision, and arithmetic | Internal event specification |
+| OD-05 | What data structure will support order-ID lookup and price-time ordering? | Dominates memory architecture and update latency | Data-structure design |
+| OD-06 | How will best bid and best ask be maintained? | Affects update complexity and latency | Architecture design |
+| OD-07 | What depth window will be used for market imbalance? | Defines the analytics calculation | Analytics specification |
+| OD-08 | What interval and reset policy will be used for VWAP? | Defines trade-statistics state | Analytics specification |
+| OD-09 | What is the exact AXI ingress and host-control interface? | Determines integration and backpressure behaviour | Interface specification |
+| OD-10 | What recovery mechanism will be implemented in the first prototype? | Determines behaviour after a feed gap | Recovery design |
+| OD-11 | How will latency be measured in simulation and hardware? | Ensures meaningful and reproducible performance claims | Verification plan |
 
 ------------------------------------------------------------------------
 
@@ -1015,27 +720,13 @@ implementation work is finalized.
 The following documents will define details that are intentionally not
 fixed in this SRD:
 
-  -----------------------------------------------------------------------
-  Document                            Responsibility
-  ----------------------------------- -----------------------------------
-  `market_data_protocol.md`           Internal event format, message
-                                      fields, event semantics,
-                                      sequencing, and protocol mapping
-
-  `hardware_architecture.md`          PL/PS partition, processing
-                                      pipeline, memories, modules, and
-                                      AXI interfaces
-
-  `order_book_design.md`              Order storage, ID lookup, price
-                                      levels, and time priority
-
-  `verification_plan.md`              Test strategy, test cases,
-                                      reference-model comparison, and
-                                      coverage
-
-  `performance_report.md`             Benchmark methodology and measured
-                                      results
-  -----------------------------------------------------------------------
+| Document | Responsibility |
+| --- | --- |
+| `market_data_protocol.md` | Internal event format, message fields, event semantics, sequencing, and protocol mapping |
+| `hardware_architecture.md` | PL/PS partition, processing pipeline, memories, modules, and AXI interfaces |
+| `order_book_design.md` | Order storage, ID lookup, price levels, and time priority |
+| `verification_plan.md` | Test strategy, test cases, reference-model comparison, and coverage |
+| `performance_report.md` | Benchmark methodology and measured results |
 
 ------------------------------------------------------------------------
 
