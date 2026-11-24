@@ -3,8 +3,8 @@
 **Project:** FPGA-Accelerated Real-Time Financial Market Data Processing
 Engine\
 **Document:** `market_data_protocol.md`\
-**Version:** 0.3 (Consolidated Protocol Draft)  
-**Status:** Consolidated working draft — agreed protocol decisions incorporated; feed-specific and interface details remain open  
+**Version:** 0.4 (Field and Mapping Specification)  
+**Status:** Field-level protocol and logical event mapping specified; feed-service and physical-interface details remain open  
 **Date:** 24 November 2026
 
 ------------------------------------------------------------------------
@@ -444,6 +444,21 @@ The remaining fields depend on the message type.
 The Tracking Number is a Nasdaq internal tracking field. It is not the
 MoldUDP64 message sequence number.
 
+### 5.2.1 Field encoding conventions
+
+| ITCH field form | Binary representation | Interpretation |
+|---|---|---|
+| Message Type and other Alpha fields | ASCII byte(s) | Character data; fixed-width Alpha fields are left-justified and space-padded where specified. |
+| Stock Locate | Unsigned 16-bit integer | Big-endian. |
+| Tracking Number | Unsigned 16-bit integer | Big-endian; feed-internal tracking only. |
+| Timestamp | Unsigned 48-bit integer | Big-endian nanoseconds since midnight. |
+| Order Reference Number | Unsigned 64-bit integer | Big-endian. |
+| Match Number | Unsigned 64-bit integer | Big-endian; uniqueness scope differs by message type as noted in Section 6.6. |
+| Shares / quantity | Unsigned 32-bit or 64-bit integer | Width is defined by the individual message field. Big-endian. |
+| Price (4) | Unsigned 32-bit integer | Big-endian integer with four implied decimal places. |
+
+All offsets in Sections 5.3–5.15 are byte offsets from the first byte of the ITCH message, including the Message Type byte. Total lengths include that byte. The two-byte MoldUDP64 Message Length prefix is outside the ITCH message and is not included in these offsets or lengths.
+
 ## 5.3 Add Order --- `A`
 
 An `A` message adds an unattributed displayed order.
@@ -478,11 +493,19 @@ of the order book.
 An `F` message has the same fields as `A`, followed by a four-byte
 Attribution field.
 
-| Field | Offset | Length |
-|---|---:|---:|
-| Common prefix and order fields | 0–35 | 36 bytes |
-| Attribution | 36 | 4 bytes |
-| **Total message length** | — | **40 bytes** |
+| Field | Offset | Length | Encoding / meaning |
+|---|---:|---:|---|
+| Message Type | 0 | 1 byte | ASCII `F` |
+| Stock Locate | 1 | 2 bytes | Unsigned integer |
+| Tracking Number | 3 | 2 bytes | Unsigned integer |
+| Timestamp | 5 | 6 bytes | Nanoseconds since midnight |
+| Order Reference Number | 11 | 8 bytes | Unsigned integer |
+| Buy/Sell Indicator | 19 | 1 byte | ASCII `B` = buy, `S` = sell |
+| Shares | 20 | 4 bytes | Unsigned integer; displayed quantity |
+| Stock | 24 | 8 bytes | ASCII symbol, right-padded with spaces |
+| Price | 32 | 4 bytes | Price (4), four implied decimal places |
+| Attribution | 36 | 4 bytes | ASCII MPID |
+| **Total message length** | — | **40 bytes** | — |
 
 The Attribution field identifies the market participant associated with
 the order.
@@ -650,15 +673,46 @@ order reference in the displayed order book.
 
 The initial project explicitly excludes `Q` cross-trade volume from its trade analytics. The ARM still recognizes and sequences the 40-byte message. It is not forwarded as a displayed-order update. The message has no effect on the current order book.
 
+| Field | Offset | Length | Encoding / meaning |
+|---|---:|---:|---|
+| Message Type | 0 | 1 byte | ASCII `Q` |
+| Stock Locate | 1 | 2 bytes | Unsigned integer |
+| Tracking Number | 3 | 2 bytes | Unsigned integer |
+| Timestamp | 5 | 6 bytes | Nanoseconds since midnight |
+| Shares | 11 | 8 bytes | Unsigned 64-bit matched cross quantity |
+| Stock | 19 | 8 bytes | ASCII symbol, right-padded with spaces |
+| Cross Price | 27 | 4 bytes | Price (4) |
+| Match Number | 31 | 8 bytes | Unsigned integer; day-unique per ITCH 5.0 description |
+| Cross Type | 39 | 1 byte | ASCII: `O` opening, `C` closing, `H` IPO/halt/pause, `I` intraday/post-close Cross Network |
+| **Total message length** | — | **40 bytes** | — |
+
 ## 5.12 Broken Trade --- `B`
 
 A `B` message is 19 bytes long and identifies a previously reported execution that has been broken. Its Match Number refers to a previously transmitted `E`, `C`, or `P` message. A trade break is final and cannot be reinstated.
 
 It does not change the current displayed order book. This project processes it to reverse an included trade-statistics contribution using the ARM-owned Match Number ledger described in Section 6.6.
 
+| Field | Offset | Length | Encoding / meaning |
+|---|---:|---:|---|
+| Message Type | 0 | 1 byte | ASCII `B` |
+| Stock Locate | 1 | 2 bytes | Unsigned integer |
+| Tracking Number | 3 | 2 bytes | Unsigned integer |
+| Timestamp | 5 | 6 bytes | Nanoseconds since midnight |
+| Match Number | 11 | 8 bytes | Match Number of the earlier `E`, `C`, or `P` execution/trade being broken |
+| **Total message length** | — | **19 bytes** | — |
+
 ## 5.13 System Event --- `S`
 
 The `S` message is 12 bytes long and communicates feed or market lifecycle events. Its event code is important for session/day handling.
+
+| Field | Offset | Length | Encoding / meaning |
+|---|---:|---:|---|
+| Message Type | 0 | 1 byte | ASCII `S` |
+| Stock Locate | 1 | 2 bytes | Unsigned integer; always zero for this message |
+| Tracking Number | 3 | 2 bytes | Unsigned integer |
+| Timestamp | 5 | 6 bytes | Nanoseconds since midnight |
+| Event Code | 11 | 1 byte | ASCII daily event code |
+| **Total message length** | — | **12 bytes** | — |
 
 Common daily event codes include:
 
@@ -720,6 +774,28 @@ The Stock Trading Action message is 25 bytes and communicates the trading state 
 Trading State values are: `H` = halted, `P` = paused (Nasdaq-listed securities), `Q` = quotation-only period, and `T` = trading on Nasdaq. The ARM tracks the state for the selected instrument and exposes it to the host. The message does not itself add, cancel, or execute displayed orders.
 
 The exact operational policy for host warnings or analytics during a halt/pause is a system-level decision. The order book must continue to reflect sequenced feed events; a trading-state change must not be mistaken for a sequence reset.
+
+## 5.16 Supported-message length cross-check
+
+The ARM parser must validate each supported ITCH message against its exact fixed length before reading fields or normalizing it. The MoldUDP64 Message Length field remains the packet-framing authority; this table is the ITCH message-level cross-check.
+
+| ITCH type | Message | Total ITCH length |
+|---|---|---:|
+| `S` | System Event | 12 bytes |
+| `R` | Stock Directory | 39 bytes |
+| `H` | Stock Trading Action | 25 bytes |
+| `A` | Add Order | 36 bytes |
+| `F` | Add Order with MPID Attribution | 40 bytes |
+| `E` | Order Executed | 31 bytes |
+| `C` | Order Executed With Price | 36 bytes |
+| `X` | Order Cancel | 23 bytes |
+| `D` | Order Delete | 19 bytes |
+| `U` | Order Replace | 35 bytes |
+| `P` | Trade (Non-Cross) | 44 bytes |
+| `Q` | Cross Trade | 40 bytes |
+| `B` | Broken Trade | 19 bytes |
+
+A message whose MoldUDP64 block length does not match the exact ITCH length for its type is malformed. It must not be partially parsed or forwarded.
 
 ------------------------------------------------------------------------
 
@@ -796,7 +872,7 @@ Prices and quantities must remain integer values in the protocol and FPGA proces
 
 ## 6.6 Match Number ledger and broken-trade ordering
 
-The ARM owns a Match Number ledger in DDR. Each entry records at least the Match Number, trading-day/feed context, originating MoldUDP64 session as metadata, source ITCH type, feed sequence, effective price when known, quantity, whether the trade was included in statistics, and whether it has already been broken. The ledger lookup must use the correct Match Number uniqueness scope; the exact scope across a possible MoldUDP64 session transition must be confirmed for the deployed feed.
+The ARM owns a Match Number ledger in DDR. Each entry records at least the Match Number, trading-day/feed context, originating MoldUDP64 session, source ITCH type, feed sequence, effective price when known, quantity, whether the trade was included in statistics, and whether it has already been broken. The ITCH 5.0 description calls the Match Number day-unique for `E`, `C`, and `Q`, but session-unique for `P`. A `B` message carries only the Match Number and does not identify the original message type. Therefore, the implementation must not assume that a bare 64-bit Match Number is globally unique across all event types and sessions. The selected feed's assignment behaviour must be confirmed; until then, the ledger must retain the complete day/session context and detect ambiguous matches rather than silently choosing one.
 
 For included `E` executions, the FPGA resolves the effective price from the referenced resting order and returns a trade-contribution report to the ARM. For included `C` and `P` messages, the price is present in the ITCH message, but the ARM must still associate the ledger entry with successful FPGA processing before treating the contribution as committed. `C` with Printable=`N` is recorded as excluded and does not require an FPGA statistics contribution.
 
@@ -1006,29 +1082,56 @@ FPGA: order-book engine + trade statistics
 
 The ARM performs transport framing, feed sequencing, ITCH parsing, instrument filtering, and normalization. The FPGA does not parse UDP, MoldUDP64, or raw ITCH messages in the initial architecture. The FPGA reports accepted trade contributions so the ARM can maintain the Match Number ledger and process later trade breaks safely.
 
-## 9.3 Normalized event fields
+## 9.3 Normalized event fields and logical bit layout
 
-The agreed logical event fields are listed below. The field widths define a 465-bit logical payload; the final bit/byte ordering and exact RTL packing must be frozen in `hardware_architecture.md` before implementation.
+The ARM parses raw ITCH messages and produces a project-defined logical event. The logical payload is exactly 465 bits and is represented as `event_payload[464:0]`. Concatenate fields in the order shown below, from the most-significant end of the vector toward the least-significant end. Multi-bit numeric fields are unsigned; the most-significant bit of each field occupies the highest bit number in that field's range. This defines the canonical logical bit order. The table therefore defines the field order and exact logical bit positions, but not the placement of bytes on individual AXI4-Stream `TDATA` lanes; the physical lane mapping belongs in `hardware_architecture.md`.
 
-| Field | Width | Purpose / validity |
-|---|---:|---|
-| Event type | 8 bits | Project event code. |
-| Order Reference Number | 64 bits | Affected order; zero/unused for event types without a displayed order. |
-| New Order Reference Number | 64 bits | Replacement order ID for `REPLACE`; otherwise zero. |
-| Side | 1 bit | Buy/sell for `ADD`; otherwise event-specific or unused. Encoding must be defined in the interface document. |
-| Price | 32 bits | Display price for `ADD`/`REPLACE`; otherwise zero unless event semantics use it. |
-| Quantity | 32 bits | Add, execute, cancel, replace, trade, or reversal quantity. |
-| Execution price | 32 bits | Explicit execution/trade price for `C`/`P` and original price for `TRADE_REVERSAL`; zero when not applicable. |
-| Match Number | 64 bits | Trade correlation for `E`, `C`, `P`, and `TRADE_REVERSAL`. |
-| Event flags | 8 bits | Includes Printable and event-specific field-valid/eligibility flags; bit definitions remain to be finalized. |
-| Feed sequence number | 64 bits | MoldUDP64 message sequence associated with this event. |
-| Exchange timestamp | 64 bits | Original 48-bit ITCH nanoseconds-since-midnight value, zero-extended. |
-| Internal stream session ID | 32 bits | ARM-owned identifier for the current ARM-to-FPGA stream epoch; distinct from the 10-byte MoldUDP64 session field. |
-| **Total** | **465 bits** | **Logical payload before byte padding.** |
+| Field | Width | Logical bit range | Purpose / validity |
+|---|---:|---:|---|
+| Event type | 8 bits | `[464:457]` | Project event code from Section 9.4. |
+| Order Reference Number | 64 bits | `[456:393]` | Affected displayed order; zero when not applicable. |
+| New Order Reference Number | 64 bits | `[392:329]` | Replacement order ID for `REPLACE`; zero otherwise. |
+| Side | 1 bit | `[328]` | `0` = BUY, `1` = SELL; valid only for `ADD`, zero otherwise. |
+| Price | 32 bits | `[327:296]` | Display price for `ADD` or replacement display price for `REPLACE`; zero otherwise. |
+| Quantity | 32 bits | `[295:264]` | Event quantity according to the validity table below. |
+| Execution Price | 32 bits | `[263:232]` | Explicit match price for `EXECUTE_WITH_PRICE` and `TRADE`; original match price for `TRADE_REVERSAL`; zero for `EXECUTE` input. |
+| Match Number | 64 bits | `[231:168]` | Match correlation for execution/trade events and reversal. Zero otherwise. |
+| Event Flags | 8 bits | `[167:160]` | Bit definitions in Section 9.3.1. |
+| Feed Sequence Number | 64 bits | `[159:96]` | MoldUDP64 message sequence assigned to the source ITCH message. |
+| Exchange Timestamp | 64 bits | `[95:32]` | Original 48-bit ITCH timestamp zero-extended to 64 bits; nanoseconds since midnight. |
+| Internal Stream Session ID | 32 bits | `[31:0]` | ARM-owned identifier for the current ARM-to-FPGA stream epoch; distinct from the 10-byte MoldUDP64 session. |
+| **Total** | **465 bits** | **`[464:0]`** | **Logical payload before byte padding.** |
+
+### 9.3.1 Event flag definitions
+
+| Bit | Name | Meaning |
+|---:|---|---|
+| 0 | `PRINTABLE` | Used only by `EXECUTE_WITH_PRICE`: `1` means ITCH Printable=`Y`; `0` means Printable=`N`. Must be zero for all other event types. |
+| 1 | `TRADE_STATS_UPDATE` | `1` means this event changes trade-statistics accumulators. It is set for `EXECUTE`, printable `EXECUTE_WITH_PRICE`, `TRADE`, and `TRADE_REVERSAL`. It is zero for non-printable `EXECUTE_WITH_PRICE` and all book-only events. The event type determines whether the arithmetic adds or subtracts. |
+| 7:2 | Reserved | Must be transmitted as zero; receivers must reject non-zero reserved bits until a versioned interface extension defines them. |
+
+### 9.3.2 Event field-validity rules
+
+Fields marked unused must be set to zero by the ARM. The FPGA must not infer meaning from a non-zero value in an unused field.
+
+| Event type | Order ID | New order ID | Side | Price | Quantity | Execution price | Match Number | Required flags |
+|---|---|---|---|---|---|---|---|---|
+| `ADD` | Valid | Zero | Valid | Display price | Added shares | Zero | Zero | All zero |
+| `EXECUTE` | Valid | Zero | Zero | Zero | Executed shares | Zero on ingress; FPGA resolves from stored order | Valid | `TRADE_STATS_UPDATE=1` |
+| `EXECUTE_WITH_PRICE` | Valid | Zero | Zero | Zero | Executed shares | Explicit ITCH execution price | Valid | `PRINTABLE` reflects `Y`/`N`; `TRADE_STATS_UPDATE=1` only for `Y` |
+| `CANCEL` | Valid | Zero | Zero | Zero | Canceled shares | Zero | Zero | All zero |
+| `DELETE` | Valid | Zero | Zero | Zero | Zero; FPGA removes all remaining shares | Zero | Zero | All zero |
+| `REPLACE` | Original ID | New ID | Zero; side inherited from original FPGA order entry | New display price | New displayed shares | Zero | Zero | All zero |
+| `TRADE` | Zero | Zero | Zero | Zero | Matched shares | Explicit ITCH `P` price | Valid | `TRADE_STATS_UPDATE=1` |
+| `TRADE_REVERSAL` | Zero | Zero | Zero | Zero | Original trade quantity | Original trade price from ARM ledger | Valid | `TRADE_STATS_UPDATE=1`; `PRINTABLE=0` |
+
+For `EXECUTE`, the FPGA must find the referenced resting order, capture its stored display price as the effective execution price, then apply the quantity reduction and issue the trade-contribution report to the ARM. The inbound execution-price field remains zero so that an absent source field cannot be mistaken for a zero-priced trade.
+
+For `P` Trade (Non-Cross), Nasdaq specifies an Order Reference Number of zero in the binary feed and a Buy/Sell Indicator of `B` from the stated effective date. Neither value describes a displayed resting order. Both are parsed/validated on the ARM and the normalized `TRADE` event carries no order ID and no meaningful side.
 
 Instrument identifier is omitted because the initial design supports one selected instrument and ARM filters before forwarding. Runtime switching invalidates/reinitializes the stream and assigns a new internal stream session ID. If multiple instruments are later supported concurrently, the event format must be extended with an instrument identifier.
 
-The local ARM receive timestamp is captured separately using the ARM's monotonic clock. It is not included in this 465-bit event payload; it is retained in ARM-side receive/latency telemetry. The exchange timestamp remains the original ITCH nanoseconds-since-midnight value and must not be substituted with local time.
+The local ARM receive timestamp is captured separately using the ARM's monotonic clock. It is not included in this logical event payload; it is retained in ARM-side receive/latency telemetry. The exchange timestamp remains the original ITCH nanoseconds-since-midnight value and must not be substituted with local time.
 
 The external MoldUDP64 session identifier is 10 bytes and is owned by the feed protocol. The internal stream session ID is 32 bits and is owned by the ARM–FPGA interface. They are not interchangeable.
 
@@ -1046,6 +1149,29 @@ The external MoldUDP64 session identifier is 10 bytes and is owned by the feed p
 | `0x08` | `TRADE_REVERSAL` | Project event generated from ITCH `B`; reverse a previously included trade contribution. |
 
 These values are project-defined and are not the ASCII ITCH message-type bytes. `Q` is recognized and sequenced by the ARM but is not forwarded as a normal book/trade-statistics event in the initial scope. `S`, `R`, and `H` are handled by the ARM control/state path and host status, not as ordinary order-book events.
+
+### 9.4.1 ITCH-to-normalized-event mapping
+
+The ARM assigns the MoldUDP64 sequence number to each ITCH message before instrument filtering. The source fields below are mapped only after the message has passed framing, length, encoding, and selected-instrument validation.
+
+| Source message | Project event | Source-to-normalized mapping | FPGA effect / special handling |
+|---|---|---|---|
+| `A` | `ADD` (`0x01`) | Order Reference Number → Order ID; Buy/Sell Indicator → Side (`B`→0, `S`→1); Shares → Quantity; Price → Price; Timestamp → Exchange Timestamp; MoldUDP64 sequence → Feed Sequence Number. | Insert displayed order. |
+| `F` | `ADD` (`0x01`) | Same mapping as `A`; parse the four-byte Attribution field but omit it from the initial normalized payload because participant analytics are out of scope. | Insert displayed order. |
+| `E` | `EXECUTE` (`0x02`) | Order Reference Number → Order ID; Executed Shares → Quantity; Match Number → Match Number; Timestamp and MoldUDP64 sequence → event metadata. Execution Price is zero on ingress. | Reduce resting quantity; resolve effective price from the FPGA order entry; report applied trade contribution to ARM. |
+| `C` Printable=`Y` | `EXECUTE_WITH_PRICE` (`0x03`) | Order Reference Number → Order ID; Executed Shares → Quantity; Execution Price → Execution Price; Match Number → Match Number; Printable=`Y` → `PRINTABLE=1`; set `TRADE_STATS_UPDATE=1`. | Reduce resting quantity and include explicit-price trade contribution. |
+| `C` Printable=`N` | `EXECUTE_WITH_PRICE` (`0x03`) | Same order fields as `C(Y)`; Printable=`N` → `PRINTABLE=0`; set `TRADE_STATS_UPDATE=0`. | Reduce resting quantity but do not add volume/VWAP contribution. Keep an excluded Match Number ledger entry so a later `B` is recognized. |
+| `X` | `CANCEL` (`0x04`) | Order Reference Number → Order ID; Canceled Shares → Quantity; timestamp and feed sequence → metadata. | Subtract canceled quantity; no trade statistics. |
+| `D` | `DELETE` (`0x05`) | Order Reference Number → Order ID; all other operation fields zero. | Remove the order's entire remaining quantity. |
+| `U` | `REPLACE` (`0x06`) | Original Order Reference Number → Order ID; New Order Reference Number → New Order ID; Shares → Quantity; Price → Price. | Replace old order with new ID, preserving the original side and inherited attributes. |
+| `P` | `TRADE` (`0x07`) | Shares → Quantity; Price → Execution Price; Match Number → Match Number; order ID and side set to zero. | Update trade statistics only; no displayed-book operation. |
+| `B` | Conditional `TRADE_REVERSAL` (`0x08`) | Match Number → ledger lookup. If the original contribution was included, ledger price/quantity → Execution Price/Quantity; preserve Match Number. | Subtract the original contribution. If the original was excluded (for example `C(N)`), mark it broken in ARM ledger without sending a reversal event. |
+| `Q` | No normalized event | Validate its full 40-byte format, instrument identity, sequence position, and cross type. | Recognize/sequence only; excluded from initial book and trade-statistics path. |
+| `S` | ARM control event only | Event Code and Timestamp update feed/day lifecycle state. | Not sent to the ordinary FPGA order-book event stream. |
+| `R` | ARM instrument-directory update | Stock Locate and Stock, plus any retained attributes, update current-day instrument map. | Not sent as an order-book event. |
+| `H` | ARM instrument-status update | Stock Locate, Trading State, Reason, and Timestamp update the selected instrument's trading state. | Not sent as an order-book event. |
+
+The ITCH Tracking Number is not mapped into the 465-bit payload. The ARM may retain it in diagnostic metadata, but it must never be substituted for the MoldUDP64 Feed Sequence Number. The Stock Locate and Stock fields are consumed by ARM-side instrument selection and are omitted from the initial single-instrument event payload.
 
 ## 9.5 AXI4-Stream transfer semantics
 
@@ -1067,7 +1193,7 @@ order-book state update.
 
 The project must therefore define separate processing-status/error reporting where required.
 
-The logical event payload is 465 bits. For the proposed 256-bit AXI4-Stream data width, it is padded to 472 bits (59 bytes) with seven zero padding bits. The transfer uses two beats:
+The logical event payload is 465 bits. For serialization as a 59-byte logical image, append seven zero padding bits after logical bit 0; equivalently, the 472-bit padded value is `{event_payload[464:0], 7'b0}`. The physical placement of those serialized bytes on AXI4-Stream `TDATA` lanes is specified in `hardware_architecture.md`. For the proposed 256-bit AXI4-Stream data width, the transfer uses two beats:
 
 | Beat | Valid bytes | `TKEEP` | `TLAST` |
 |---|---:|---:|---:|
@@ -1254,9 +1380,9 @@ The following items remain open after consolidation. They are not silently assum
 | OI-01 | Exact feed product and service configuration | Confirm multicast groups, ports, re-request servers, entitlement, maximum packet size, request limits, and retention window with the actual provider. |
 | OI-02 | Snapshot/recovery service | Confirm whether GLIMPSE or another service is available, its snapshot format, synchronization marker semantics, and cutover procedure. |
 | OI-03 | Recovery buffering and timeout parameters | Select buffer capacity, reorder window, timeout, retry policy, and snapshot escalation behaviour from measured traffic and service limits. |
-| OI-04 | Normalized-event packing | Freeze field bit order, byte order, field offsets, flag definitions, reserved-bit values, and exact `TKEEP`/`TLAST` framing in `hardware_architecture.md`. |
+| OI-04 | Physical AXI4-Stream packing | Define the mapping of the serialized 59-byte logical event image to `TDATA` byte lanes, endianness at the lane boundary, and exact `TKEEP`/`TLAST` implementation in `hardware_architecture.md`. |
 | OI-05 | Processing-report interface | Define report queue depth, report encoding, sequence-progress watermark, timeout, and the precise `B` barrier protocol. |
-| OI-06 | Match Number ledger capacity, uniqueness scope, and persistence | Confirm Match Number uniqueness scope across feed-session transitions; size the DDR hash table; define collision handling, retention, archival, restart persistence, and daily rollover. |
+| OI-06 | Match Number ledger identity and persistence | Confirm provider-specific Match Number namespace behaviour (especially `P` session-unique versus `E`/`C` day-unique); size the DDR hash table; define collision handling, retention, archival, restart persistence, and daily rollover. |
 | OI-07 | Snapshot transfer interface | Define snapshot entry layout, loading protocol, checksum algorithm/coverage, completion signalling, and interaction with normal event ingress. |
 | OI-08 | Trade-statistics scope | Confirm whether additional analytics beyond cumulative volume and VWAP are required, including rolling windows and any separate cross-volume metric. |
 | OI-09 | Timestamp and latency measurement | Define ARM monotonic clock source, timestamp capture point, clock synchronization assumptions, and how exchange/local timestamps are compared. |
@@ -1327,6 +1453,133 @@ Expected top of book:
 The example is illustrative. A complete test vector must include the
 exact binary ITCH message bytes and MoldUDP64 packet framing.
 
+
 ------------------------------------------------------------------------
 
-**End of document --- Version 0.3**
+# Appendix C --- Worked ITCH Bytes-to-Normalized-Event Examples
+
+The following vectors are synthetic protocol test vectors. They demonstrate byte offsets, big-endian decoding, MoldUDP64 sequence assignment, and the logical normalized-event values. They are not captured exchange traffic.
+
+## C.1 Example 1: MoldUDP64 packet carrying an Add Order (`A`)
+
+Assume the MoldUDP64 session is the ten-byte ASCII value `SIM2026A01`, the first message sequence number is 500, and the packet contains one message. The ITCH message is an Add Order for symbol `ABC`, Stock Locate 7, order reference `0x0102030405060708`, buy side, 1,000 shares, and price `100.0000`.
+
+### MoldUDP64 packet header and block prefix
+
+| Field | Bytes (hex) | Interpretation |
+|---|---|---|
+| Session | `53 49 4D 32 30 32 36 41 30 31` | ASCII `SIM2026A01` |
+| Sequence Number | `00 00 00 00 00 00 01 F4` | 500; sequence of first message |
+| Message Count | `00 01` | One message block |
+| Message Length | `00 24` | 36 ITCH message bytes; excludes this two-byte prefix |
+
+### ITCH `A` message bytes
+
+| Offset | Field | Bytes (hex) | Decoded value |
+|---:|---|---|---|
+| 0 | Message Type | `41` | `A` |
+| 1 | Stock Locate | `00 07` | 7 |
+| 3 | Tracking Number | `12 34` | `0x1234` (not the MoldUDP64 sequence) |
+| 5 | Timestamp | `00 00 3B 9A CA 00` | 1,000,000,000 ns since midnight |
+| 11 | Order Reference Number | `01 02 03 04 05 06 07 08` | `0x0102030405060708` |
+| 19 | Buy/Sell Indicator | `42` | ASCII `B` = buy |
+| 20 | Shares | `00 00 03 E8` | 1,000 |
+| 24 | Stock | `41 42 43 20 20 20 20 20` | `ABC` followed by five spaces |
+| 32 | Price | `00 0F 42 40` | 1,000,000 × 10⁻⁴ = `100.0000` |
+| — | **Total** | **36 bytes** | — |
+
+### Resulting normalized `ADD` event
+
+Assume the ARM has assigned internal stream session ID 1.
+
+| Normalized field | Value | Explanation |
+|---|---|---|
+| Event type | `0x01` | `ADD` |
+| Order Reference Number | `0x0102030405060708` | From ITCH offset 11 |
+| New Order Reference Number | `0` | Unused for `ADD` |
+| Side | `0` | BUY |
+| Price | `1,000,000` | Raw Price (4) integer; display as `100.0000` |
+| Quantity | `1,000` | From Shares |
+| Execution Price | `0` | Unused for `ADD` |
+| Match Number | `0` | Unused for `ADD` |
+| Event Flags | `0x00` | No flags set |
+| Feed Sequence Number | `500` | Assigned by MoldUDP64 header/block position |
+| Exchange Timestamp | `1,000,000,000` | Zero-extended 48-bit ITCH timestamp |
+| Internal Stream Session ID | `1` | ARM-owned stream epoch |
+
+The FPGA inserts the order into the buy side of the displayed order book. The ITCH Stock Locate and Stock fields are consumed by the ARM's instrument filter and are not repeated in the single-instrument normalized payload.
+
+## C.2 Example 2: Order Executed (`E`) and FPGA price resolution
+
+Assume the order from Example C.1 is still present with 1,000 shares at `100.0000`. The next ITCH message reports that 250 shares were executed. The MoldUDP64-assigned sequence is 501.
+
+### ITCH `E` message bytes
+
+| Offset | Field | Bytes (hex) | Decoded value |
+|---:|---|---|---|
+| 0 | Message Type | `45` | `E` |
+| 1 | Stock Locate | `00 07` | 7 |
+| 3 | Tracking Number | `12 35` | `0x1235` |
+| 5 | Timestamp | `00 00 77 35 94 00` | 2,000,000,000 ns since midnight |
+| 11 | Order Reference Number | `01 02 03 04 05 06 07 08` | `0x0102030405060708` |
+| 19 | Executed Shares | `00 00 00 FA` | 250 |
+| 23 | Match Number | `11 22 33 44 55 66 77 88` | `0x1122334455667788` |
+| — | **Total** | **31 bytes** | — |
+
+### Resulting normalized `EXECUTE` event
+
+| Normalized field | Value | Explanation |
+|---|---|---|
+| Event type | `0x02` | `EXECUTE` |
+| Order Reference Number | `0x0102030405060708` | Referenced resting order |
+| New Order Reference Number | `0` | Unused |
+| Side | `0` | Unused; must be zero |
+| Price | `0` | Unused |
+| Quantity | `250` | Executed shares |
+| Execution Price | `0` on ingress | The ITCH `E` message contains no execution price |
+| Match Number | `0x1122334455667788` | From ITCH message |
+| Event Flags | `0x02` | `TRADE_STATS_UPDATE=1` |
+| Feed Sequence Number | `501` | MoldUDP64 sequence |
+| Exchange Timestamp | `2,000,000,000` | Zero-extended ITCH timestamp |
+| Internal Stream Session ID | `1` | Same stream epoch as Example C.1 |
+
+The FPGA looks up the order and resolves the effective execution price from its stored display price: `1,000,000` (`100.0000`). It reduces the remaining order quantity to 750 and sends the ARM a trade-contribution report containing the feed sequence, Match Number, effective price, quantity, and processing result. The ARM commits this information to its Match Number ledger only after the report confirms successful processing.
+
+## C.3 Example 3: Broken Trade (`B`) and normalized reversal
+
+Assume the ARM has received and committed the successful trade-contribution report from Example C.2. A later `B` message references the same Match Number. The ARM waits for its ordered processing barrier, looks up the committed ledger entry, and constructs a reversal. The MoldUDP64 sequence is 502.
+
+### ITCH `B` message bytes
+
+| Offset | Field | Bytes (hex) | Decoded value |
+|---:|---|---|---|
+| 0 | Message Type | `42` | `B` |
+| 1 | Stock Locate | `00 07` | 7 |
+| 3 | Tracking Number | `12 36` | `0x1236` |
+| 5 | Timestamp | `00 00 B2 D0 5E 00` | 3,000,000,000 ns since midnight |
+| 11 | Match Number | `11 22 33 44 55 66 77 88` | `0x1122334455667788` |
+| — | **Total** | **19 bytes** | — |
+
+### Resulting normalized `TRADE_REVERSAL` event
+
+| Normalized field | Value | Explanation |
+|---|---|---|
+| Event type | `0x08` | `TRADE_REVERSAL` |
+| Order Reference Number | `0` | A trade reversal does not modify the current displayed order |
+| New Order Reference Number | `0` | Unused |
+| Side | `0` | Unused |
+| Price | `0` | Unused |
+| Quantity | `250` | Original trade quantity from ARM ledger |
+| Execution Price | `1,000,000` | Original effective execution price from ARM ledger (`100.0000`) |
+| Match Number | `0x1122334455667788` | Match being reversed |
+| Event Flags | `0x02` | `TRADE_STATS_UPDATE=1`; event code defines subtraction |
+| Feed Sequence Number | `502` | Sequence of the `B` message |
+| Exchange Timestamp | `3,000,000,000` | Timestamp of the `B` message, zero-extended |
+| Internal Stream Session ID | `1` | Same stream epoch |
+
+The FPGA subtracts `250` from the trade volume accumulator and `1,000,000 × 250` from the notional accumulator. The order book remains unchanged by the reversal. The ARM marks the ledger entry broken so a duplicate `B` cannot reverse it twice. If the original ledger entry were for an excluded `C` message with Printable=`N`, the ARM would mark it broken without sending a `TRADE_REVERSAL` event.
+
+
+------------------------------------------------------------------------
+
+**End of document --- Version 0.4**
