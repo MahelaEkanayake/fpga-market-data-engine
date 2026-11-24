@@ -1677,4 +1677,4 @@ The FPGA subtracts `250` from the trade volume accumulator and `1,000,000 × 250
 
 ------------------------------------------------------------------------
 
-**End of document --- Version 0.4**
+**End of document --- Version 0.5**
