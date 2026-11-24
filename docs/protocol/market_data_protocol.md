@@ -3,8 +3,8 @@
 **Project:** FPGA-Accelerated Real-Time Financial Market Data Processing
 Engine\
 **Document:** `market_data_protocol.md`\
-**Version:** 0.4 (Field and Mapping Specification)  
-**Status:** Field-level protocol and logical event mapping specified; feed-service and physical-interface details remain open  
+**Version:** 0.5 (Protocol Edge-Case and Serialization Clarification)  
+**Status:** Field-level protocol, event mapping, historical P-message compatibility, broken-trade routing, and canonical event-byte serialization specified; provider-specific recovery and implementation verification remain open  
 **Date:** 24 November 2026
 
 ------------------------------------------------------------------------
@@ -19,6 +19,14 @@ Engine\
 | Initial instrument scope | One selected instrument |
 | Primary implementation split | ARM handles network/feed protocol processing; FPGA handles order-book reconstruction and analytics |
 | Related documents | `system_requirements.md`, `hardware_architecture.md`, `order_book_design.md`, `verification_plan.md` |
+
+### Revision 0.5 changes
+
+- Added historical compatibility handling for the `P` Buy/Sell Indicator (`B` or legacy `S`) without treating it as an order side.
+- Specified message-type-aware routing for global `S` System Event and instrument-specific `B` Broken Trade messages, including Stock Locate validation against the ARM ledger.
+- Defined the canonical 59-byte MSB-first logical event serialization and its mapping to ascending 256-bit AXI4-Stream byte lanes.
+- Retained the 465-bit logical payload and two-beat 256-bit transfer; deferred width compression until measured resource/performance results justify a versioned interface change.
+- Updated parser and ARM–FPGA verification requirements and refined OI-04 as an implementation-conformance task.
 
 ### Status conventions
 
@@ -641,27 +649,39 @@ number is replaced by a new reference number.
 A `P` message reports a trade involving non-displayed order types. It
 does not change the displayed order book.
 
-| Field | Offset | Length |
-|---|---:|---:|
-| Message Type | 0 | 1 byte |
-| Stock Locate | 1 | 2 bytes |
-| Tracking Number | 3 | 2 bytes |
-| Timestamp | 5 | 6 bytes |
-| Order Reference Number | 11 | 8 bytes |
-| Buy/Sell Indicator | 19 | 1 byte |
-| Shares | 20 | 4 bytes |
-| Stock | 24 | 8 bytes |
-| Price | 32 | 4 bytes |
-| Match Number | 36 | 8 bytes |
-| **Total message length** | — | **44 bytes** |
+| Field | Offset | Length | Encoding / meaning |
+|---|---:|---:|---|
+| Message Type | 0 | 1 byte | ASCII `P` |
+| Stock Locate | 1 | 2 bytes | Unsigned integer; identifies the security |
+| Tracking Number | 3 | 2 bytes | Unsigned integer; Nasdaq internal tracking field |
+| Timestamp | 5 | 6 bytes | Nanoseconds since midnight |
+| Order Reference Number | 11 | 8 bytes | Unsigned integer; zero in the documented binary feed since 6 December 2010 |
+| Buy/Sell Indicator | 19 | 1 byte | ASCII `B` or `S`; current-feed expectation and historical compatibility are explained below |
+| Shares | 20 | 4 bytes | Unsigned integer; matched quantity |
+| Stock | 24 | 8 bytes | ASCII symbol, right-padded with spaces |
+| Price | 32 | 4 bytes | Price (4); four implied decimal places |
+| Match Number | 36 | 8 bytes | Unsigned integer; session-unique for this trade message |
+| **Total message length** | — | **44 bytes** | — |
 
-The ITCH 5.0 specification notes that the Order Reference Number is
-populated as zero for this message and that the Buy/Sell Indicator is
-always `B` under the specified effective date. The project must not
-interpret this message as an ordinary displayed-order update.
+For current TotalView-ITCH 5.0 production data, the Order Reference
+Number is expected to be zero. The Buy/Sell Indicator at offset 19 is
+expected to be `B` effective 14 July 2014, regardless of the resting side.
+Neither field describes a displayed resting order, and neither is mapped
+to the normalized event's Side field.
 
-`P` messages should contribute to trade statistics according to the
-project's defined market-statistics policy.
+**Historical-capture compatibility:** The parser must accept either
+ASCII `B` or ASCII `S` in this one-byte field so that older historical
+captures can be decoded. A configured current-feed conformance check may
+record `S` as a non-fatal protocol warning because it differs from the
+post-14-July-2014 production convention. Any value other than `B` or `S`
+is invalid. The compatibility rule does not change the 44-byte message
+length and must not cause the parser to reject an otherwise valid `P`
+message solely because offset 19 contains `S`.
+
+`P` messages contribute to trade statistics according to the project's
+market-statistics policy. The ARM should retain the raw indicator in
+parser diagnostics when useful, but the normalized `TRADE` event carries
+no meaningful side.
 
 ## 5.11 Cross Trade --- `Q`
 
@@ -688,15 +708,15 @@ The initial project explicitly excludes `Q` cross-trade volume from its trade an
 
 ## 5.12 Broken Trade --- `B`
 
-A `B` message is 19 bytes long and identifies a previously reported execution that has been broken. Its Match Number refers to a previously transmitted `E`, `C`, or `P` message. A trade break is final and cannot be reinstated.
+A `B` message is 19 bytes long and identifies a previously reported execution that has been broken. Its Match Number refers to a previously transmitted `E`, `C`, or `P` message. Its Stock Locate identifies the security associated with the broken execution; unlike the global `S` System Event message, `B` is instrument-specific. A trade break is final and cannot be reinstated.
 
-It does not change the current displayed order book. This project processes it to reverse an included trade-statistics contribution using the ARM-owned Match Number ledger described in Section 6.6.
+It does not change the current displayed order book. This project processes it through the ARM-owned Match Number ledger described in Section 6.6, and reverses trade statistics only when the original contribution was included. The ARM must validate the `B` message's Stock Locate against the instrument/locate recorded with the matched ledger entry before issuing a reversal.
 
 | Field | Offset | Length | Encoding / meaning |
 |---|---:|---:|---|
 | Message Type | 0 | 1 byte | ASCII `B` |
-| Stock Locate | 1 | 2 bytes | Unsigned integer |
-| Tracking Number | 3 | 2 bytes | Unsigned integer |
+| Stock Locate | 1 | 2 bytes | Unsigned integer; identifies the security associated with the broken execution |
+| Tracking Number | 3 | 2 bytes | Unsigned integer; Nasdaq internal tracking field |
 | Timestamp | 5 | 6 bytes | Nanoseconds since midnight |
 | Match Number | 11 | 8 bytes | Match Number of the earlier `E`, `C`, or `P` execution/trade being broken |
 | **Total message length** | — | **19 bytes** | — |
@@ -820,9 +840,28 @@ parsed message belongs to the selected instrument.
 Messages for other instruments are not forwarded to the FPGA, but they
 still count as received feed messages for sequence tracking.
 
-Messages with Stock Locate zero or messages that are not
-instrument-specific must be handled according to their message semantics
-rather than treated as ordinary instrument events.
+Message routing is message-type-aware; the ARM must not apply a single
+Stock Locate filter blindly to every message:
+
+- `S` (System Event) has Stock Locate `0` by definition. It is a global
+  feed/day lifecycle message and must be processed by the ARM control
+  path regardless of the selected instrument. It is not forwarded as an
+  ordinary order-book event.
+- `B` (Broken Trade) is instrument-specific and carries the Stock Locate
+  of the security whose execution was broken. After feed-wide sequence
+  accounting, the ARM checks this locate against the active instrument.
+  For the selected instrument, the ARM routes the message to the broken-
+  trade path and looks up its Match Number in the ledger. Before issuing a
+  reversal, it verifies that the ledger entry identifies the same
+  instrument/Stock Locate. A `B` with Stock Locate `0`, an unknown Match
+  Number, or a locate/ledger mismatch must not cause a guessed reversal;
+  record the error and invalidate `TRADE_STATS_VALID` as appropriate.
+  A `B` for another instrument is not sent to the selected instrument's
+  FPGA path, but it still consumes its normal feed sequence position.
+- Other messages with Stock Locate `0`, or messages that are not
+  instrument-specific, are handled according to their documented
+  semantics and the explicit ARM control/skip policy. They must not be
+  mistaken for selected-instrument order events.
 
 ## 6.3 Order state transitions
 
@@ -852,11 +891,13 @@ The initial trade-statistics inclusion policy is:
 | `E` | Reduce the referenced resting order | Include the execution. Effective price is obtained from the resting order's stored display price. |
 | `C` with Printable=`Y` | Reduce the referenced resting order | Include using the explicit execution price. |
 | `C` with Printable=`N` | Reduce the referenced resting order | Exclude from ordinary volume/VWAP; the shares are represented in a later bulk print. Retain its Match Number as an excluded ledger entry so a later `B` is recognized. |
-| `P` | No displayed-book update | Include using its explicit price and shares. The Order Reference Number is zero in the specified feed format; the Buy/Sell Indicator is always `B` from the documented effective date and must not be interpreted as the resting-side indicator. |
+| `P` | No displayed-book update | Include using its explicit price and shares. The Order Reference Number is zero in the documented feed format. Current feeds are expected to carry `B` at the Buy/Sell Indicator; historical compatibility accepts `B` or `S`. Neither value is interpreted as the selected instrument's displayed resting-order side. |
 | `Q` | No displayed-order update | Exclude from the initial analytics scope. Recognize and sequence the message. |
 | `B` | No displayed-book update | Reverse the original included contribution for the referenced Match Number, if one exists and was included. |
 
 A `B` message refers to a previously transmitted `E`, `C`, or `P` message. It does not refer to a `Q` cross-trade message. A trade break is final and must not be applied twice.
+
+For `P`, the parser accepts ASCII `B` and legacy ASCII `S` in the Buy/Sell Indicator field for historical-capture compatibility. In a current-feed conformance profile, `S` is recorded as a non-fatal deviation from the post-14-July-2014 expectation; it is not grounds by itself to reject the message or to infer a resting-order side.
 
 For VWAP, maintain integer accumulators:
 
@@ -872,7 +913,9 @@ Prices and quantities must remain integer values in the protocol and FPGA proces
 
 ## 6.6 Match Number ledger and broken-trade ordering
 
-The ARM owns a Match Number ledger in DDR. Each entry records at least the Match Number, trading-day/feed context, originating MoldUDP64 session, source ITCH type, feed sequence, effective price when known, quantity, whether the trade was included in statistics, and whether it has already been broken. The ITCH 5.0 description calls the Match Number day-unique for `E`, `C`, and `Q`, but session-unique for `P`. A `B` message carries only the Match Number and does not identify the original message type. Therefore, the implementation must not assume that a bare 64-bit Match Number is globally unique across all event types and sessions. The selected feed's assignment behaviour must be confirmed; until then, the ledger must retain the complete day/session context and detect ambiguous matches rather than silently choosing one.
+The ARM owns a Match Number ledger in DDR. Each entry records at least the Match Number, trading-day/feed context, originating MoldUDP64 session, source ITCH type, feed sequence, Stock Locate (and the resolved instrument identity), effective price when known, quantity, whether the trade was included in statistics, and whether it has already been broken.
+
+The ITCH 5.0 specification describes Match Numbers for `E` and `C` executions as day-unique, and Match Numbers for `P` trades as session-unique. `Q` also carries a day-unique Match Number, but `Q` is excluded from this project's initial analytics. A `B` message carries the Stock Locate and Match Number of the broken execution, but does not identify the original message type or its session. Therefore, the implementation must not assume that a bare 64-bit Match Number is globally unique across all event types and sessions. The selected feed's assignment behaviour and the practical relationship between these namespaces must be confirmed. Until then, the ledger must retain day, session, message type, sequence, and instrument context; lookup must detect ambiguous candidates rather than silently choosing one.
 
 For included `E` executions, the FPGA resolves the effective price from the referenced resting order and returns a trade-contribution report to the ARM. For included `C` and `P` messages, the price is present in the ITCH message, but the ARM must still associate the ledger entry with successful FPGA processing before treating the contribution as committed. `C` with Printable=`N` is recorded as excluded and does not require an FPGA statistics contribution.
 
@@ -1084,7 +1127,7 @@ The ARM performs transport framing, feed sequencing, ITCH parsing, instrument fi
 
 ## 9.3 Normalized event fields and logical bit layout
 
-The ARM parses raw ITCH messages and produces a project-defined logical event. The logical payload is exactly 465 bits and is represented as `event_payload[464:0]`. Concatenate fields in the order shown below, from the most-significant end of the vector toward the least-significant end. Multi-bit numeric fields are unsigned; the most-significant bit of each field occupies the highest bit number in that field's range. This defines the canonical logical bit order. The table therefore defines the field order and exact logical bit positions, but not the placement of bytes on individual AXI4-Stream `TDATA` lanes; the physical lane mapping belongs in `hardware_architecture.md`.
+The ARM parses raw ITCH messages and produces a project-defined logical event. The logical payload is exactly 465 bits and is represented as `event_payload[464:0]`. Concatenate fields in the order shown below, from the most-significant end of the vector toward the least-significant end. Multi-bit numeric fields are unsigned; the most-significant bit of each field occupies the highest bit number in that field's range. This defines the canonical logical bit order. Section 9.5 defines how this logical vector is converted into a 59-byte image and mapped to AXI4-Stream byte lanes; `hardware_architecture.md` must implement and verify that contract.
 
 | Field | Width | Logical bit range | Purpose / validity |
 |---|---:|---:|---|
@@ -1127,13 +1170,15 @@ Fields marked unused must be set to zero by the ARM. The FPGA must not infer mea
 
 For `EXECUTE`, the FPGA must find the referenced resting order, capture its stored display price as the effective execution price, then apply the quantity reduction and issue the trade-contribution report to the ARM. The inbound execution-price field remains zero so that an absent source field cannot be mistaken for a zero-priced trade.
 
-For `P` Trade (Non-Cross), Nasdaq specifies an Order Reference Number of zero in the binary feed and a Buy/Sell Indicator of `B` from the stated effective date. Neither value describes a displayed resting order. Both are parsed/validated on the ARM and the normalized `TRADE` event carries no order ID and no meaningful side.
+For `P` Trade (Non-Cross), Nasdaq specifies an Order Reference Number of zero in the binary feed and a Buy/Sell Indicator of `B` from the stated effective date. The parser also accepts historical `S` values as described in Section 5.10. Neither value describes a displayed resting order. Both are parsed/validated on the ARM and the normalized `TRADE` event carries no order ID and no meaningful side.
 
 Instrument identifier is omitted because the initial design supports one selected instrument and ARM filters before forwarding. Runtime switching invalidates/reinitializes the stream and assigns a new internal stream session ID. If multiple instruments are later supported concurrently, the event format must be extended with an instrument identifier.
 
 The local ARM receive timestamp is captured separately using the ARM's monotonic clock. It is not included in this logical event payload; it is retained in ARM-side receive/latency telemetry. The exchange timestamp remains the original ITCH nanoseconds-since-midnight value and must not be substituted with local time.
 
 The external MoldUDP64 session identifier is 10 bytes and is owned by the feed protocol. The internal stream session ID is 32 bits and is owned by the ARM–FPGA interface. They are not interchangeable.
+
+**Payload-width decision:** Revision 0.5 retains the 465-bit logical event format. The project does not narrow the native 48-bit timestamp, pack Side into Event Flags, or reduce the 32-bit internal stream session ID in this revision. Width optimization is deferred until synthesis, timing, buffering, and end-to-end throughput measurements demonstrate a meaningful benefit. Any future field-width or field-layout change requires an explicit normalized-interface version change and updated ARM/RTL golden vectors.
 
 ## 9.4 Project-defined event codes
 
@@ -1164,8 +1209,8 @@ The ARM assigns the MoldUDP64 sequence number to each ITCH message before instru
 | `X` | `CANCEL` (`0x04`) | Order Reference Number → Order ID; Canceled Shares → Quantity; timestamp and feed sequence → metadata. | Subtract canceled quantity; no trade statistics. |
 | `D` | `DELETE` (`0x05`) | Order Reference Number → Order ID; all other operation fields zero. | Remove the order's entire remaining quantity. |
 | `U` | `REPLACE` (`0x06`) | Original Order Reference Number → Order ID; New Order Reference Number → New Order ID; Shares → Quantity; Price → Price. | Replace old order with new ID, preserving the original side and inherited attributes. |
-| `P` | `TRADE` (`0x07`) | Shares → Quantity; Price → Execution Price; Match Number → Match Number; order ID and side set to zero. | Update trade statistics only; no displayed-book operation. |
-| `B` | Conditional `TRADE_REVERSAL` (`0x08`) | Match Number → ledger lookup. If the original contribution was included, ledger price/quantity → Execution Price/Quantity; preserve Match Number. | Subtract the original contribution. If the original was excluded (for example `C(N)`), mark it broken in ARM ledger without sending a reversal event. |
+| `P` | `TRADE` (`0x07`) | Shares → Quantity; Price → Execution Price; Match Number → Match Number; Order Reference Number → zero/unused; Buy/Sell Indicator is parsed as `B` or historical `S` for compatibility but is not mapped; order ID and side set to zero. | Update trade statistics only; no displayed-book operation. |
+| `B` | Conditional `TRADE_REVERSAL` (`0x08`) | Stock Locate → selected-instrument check and ledger sanity check; Match Number → ledger lookup. If the original contribution was included, ledger price/quantity → Execution Price/Quantity; preserve Match Number. | Subtract the original contribution only after the ledger instrument/Stock Locate matches the `B` message. If the original was excluded (for example `C(N)`), mark it broken in ARM ledger without sending a reversal event. |
 | `Q` | No normalized event | Validate its full 40-byte format, instrument identity, sequence position, and cross type. | Recognize/sequence only; excluded from initial book and trade-statistics path. |
 | `S` | ARM control event only | Event Code and Timestamp update feed/day lifecycle state. | Not sent to the ordinary FPGA order-book event stream. |
 | `R` | ARM instrument-directory update | Stock Locate and Stock, plus any retained attributes, update current-day instrument map. | Not sent as an order-book event. |
@@ -1173,34 +1218,83 @@ The ARM assigns the MoldUDP64 sequence number to each ITCH message before instru
 
 The ITCH Tracking Number is not mapped into the 465-bit payload. The ARM may retain it in diagnostic metadata, but it must never be substituted for the MoldUDP64 Feed Sequence Number. The Stock Locate and Stock fields are consumed by ARM-side instrument selection and are omitted from the initial single-instrument event payload.
 
-## 9.5 AXI4-Stream transfer semantics
+## 9.5 AXI4-Stream transfer semantics and canonical byte serialization
 
-The proposed event-data path uses AXI4-Stream.
+The proposed event-data path uses AXI4-Stream. A transfer is accepted on
+a clock edge when `TVALID=1` and `TREADY=1`. If `TVALID` is asserted
+while `TREADY` is low, the producer must keep `TVALID`, `TDATA`, `TKEEP`,
+and `TLAST` stable until the transfer is accepted.
 
-A transfer is accepted on a clock edge when:
+The AXI4-Stream handshake confirms transfer acceptance only. It does not
+mean that the FPGA has completed the order-book state update. Processing
+completion and errors are reported through the separate interface
+described in Section 9.7.
 
-``` text
-TVALID = 1 and TREADY = 1
+### 9.5.1 Canonical serialized event image
+
+The 465-bit logical event payload is serialized as a 59-byte,
+most-significant-byte-first image. Seven zero padding bits are appended
+after logical bit 0:
+
+```systemverilog
+logic [464:0] event_payload;
+logic [471:0] event_image;
+
+assign event_image = {event_payload[464:0], 7'b0};
 ```
 
-If `TVALID` is asserted while `TREADY` is low, the producer must keep
-`TVALID` asserted and keep the payload stable until the transfer is
-accepted.
+For serialized byte index `i`, where `0 <= i < 59`:
 
-The AXI-Stream handshake confirms that the interface accepted a
-transfer. It does not necessarily mean that the FPGA has completed the
-order-book state update.
+```systemverilog
+serialized_byte[i] = event_image[471 - 8*i -: 8];
+```
 
-The project must therefore define separate processing-status/error reporting where required.
+Therefore, byte 0 contains `event_payload[464:457]`, and bytes proceed
+from the most-significant end of the logical payload toward the least-
+significant end. The final serialized byte contains the remaining seven
+payload bits followed by the single least-significant padding bit. The
+padding bit must be zero.
 
-The logical event payload is 465 bits. For serialization as a 59-byte logical image, append seven zero padding bits after logical bit 0; equivalently, the 472-bit padded value is `{event_payload[464:0], 7'b0}`. The physical placement of those serialized bytes on AXI4-Stream `TDATA` lanes is specified in `hardware_architecture.md`. For the proposed 256-bit AXI4-Stream data width, the transfer uses two beats:
+This is a project serialization convention. It is deliberately distinct
+from the numeric byte order used by the ITCH parser: ITCH multi-byte
+fields are decoded from big-endian network byte order into logical
+integer values first; the complete normalized event is then serialized
+according to the rule above.
 
-| Beat | Valid bytes | `TKEEP` | `TLAST` |
-|---|---:|---:|---:|
-| 1 | 32 | `0xFFFFFFFF` | `0` |
-| 2 | 27 | `0x07FFFFFF` | `1` |
+### 9.5.2 Mapping serialized bytes to AXI4-Stream lanes
 
-The five unused byte lanes in the second beat and the seven padding bits must be zero. `TKEEP[26:0]` is asserted and `TKEEP[31:27]` is deasserted on beat 2, so the valid bytes occupy byte lanes 0 through 26. The exact mapping of logical fields to byte lanes and bit positions remains an interface freeze item; the table above fixes the transfer length and valid-byte count. The producer must hold `TVALID`, `TDATA`, `TKEEP`, and `TLAST` stable while stalled (`TREADY=0`).
+For a 256-bit `TDATA` interface, each AXI byte lane carries one
+consecutive serialized byte. Byte lane 0 is `TDATA[7:0]`, lane 1 is
+`TDATA[15:8]`, and so on. The first serialized (most-significant) event
+byte is therefore placed in the least-significant AXI byte lane:
+
+```systemverilog
+// Beat 0: serialized bytes 0 through 31
+TDATA_beat0[8*i +: 8] = serialized_byte[i];       // 0 <= i <= 31
+
+// Beat 1: serialized bytes 32 through 58
+TDATA_beat1[8*i +: 8] = serialized_byte[32 + i];  // 0 <= i <= 26
+```
+
+The transfer uses two beats:
+
+| Beat | Serialized byte indexes | Valid bytes | `TKEEP` | `TLAST` |
+|---|---|---:|---|---:|
+| 0 | 0–31 | 32 | `0xFFFFFFFF` | `0` |
+| 1 | 32–58 | 27 | `0x07FFFFFF` | `1` |
+
+On beat 1, `TKEEP[26:0]` is asserted and `TKEEP[31:27]` is deasserted.
+The five unused byte lanes must be driven to zero. All seven padding
+bits in the final serialized byte must also be zero. The AXI lane mapping
+is not native little-endian integer serialization: it is the explicitly
+defined mapping of the first serialized byte to `TDATA[7:0]`.
+
+The ARM C/C++ implementation must use explicit byte-wise packing and
+unpacking according to this contract. It must not rely on native C++
+structure layout, compiler padding, or host endianness. The corresponding
+SystemVerilog implementation must use the same byte-index convention.
+`hardware_architecture.md` must repeat this mapping in the interface
+specification and include shared golden test vectors for ARM and RTL.
 
 ## 9.6 Control and status path
 
@@ -1330,7 +1424,7 @@ message block. - Invalid message count or inconsistent packet length.
 
 At minimum, test: - Valid `S`, `R`, `H`, `A`, `F`, `E`, `C`, `X`, `D`, `U`, `P`, `Q`, and `B` messages. - Correct field offsets and lengths, including `R` (39 bytes) and `H` (25 bytes). - Big-endian
 decoding. - ASCII and space-padded fields. - Price scaling. -
-Nanoseconds-since-midnight timestamp decoding. - Unsupported message
+Nanoseconds-since-midnight timestamp decoding. - `P` Buy/Sell Indicator=`B` in current-feed mode. - Historical `P` message with Buy/Sell Indicator=`S` accepted in compatibility mode and not mapped to Side. - Invalid `P` indicator values rejected or flagged as malformed according to parser policy. - Unsupported message
 type. - Invalid message length. - Boundary values for quantity, price
 and order reference fields.
 
@@ -1354,7 +1448,7 @@ until synchronization is complete.
 
 ## 12.5 ARM--FPGA interface test cases
 
-At minimum, test: - Correct normalized event encoding and padding. - Correct sequence and internal stream-session preservation. - Two-beat 256-bit AXI4-Stream framing, `TKEEP`, and `TLAST`. - `TVALID`/`TREADY` handshake and stable payload during backpressure. - No event reordering. - Invalid event code. - FPGA processing error reporting. - Ordered processing-progress reporting. - Trade-contribution reports for `E`, `C(Y)`, and `P`. - `B` barrier and reversal ordering. - Independent `FEED_VALID`, `BOOK_VALID`, and `TRADE_STATS_VALID` transitions.
+At minimum, test: - Correct normalized event encoding and padding. - Canonical MSB-first 59-byte serialization. - First serialized byte placed on `TDATA[7:0]`; subsequent bytes placed on ascending byte lanes. - Correct two-beat 256-bit AXI4-Stream framing, `TKEEP`, and `TLAST`. - ARM and RTL agree on shared golden vectors. - Correct sequence and internal stream-session preservation. - `TVALID`/`TREADY` handshake and stable payload during backpressure. - No event reordering. - Invalid event code. - FPGA processing error reporting. - Ordered processing-progress reporting. - Trade-contribution reports for `E`, `C(Y)`, and `P`. - `B` barrier and reversal ordering. - Independent `FEED_VALID`, `BOOK_VALID`, and `TRADE_STATS_VALID` transitions.
 
 ## 12.6 Reference-model comparison
 
@@ -1380,7 +1474,7 @@ The following items remain open after consolidation. They are not silently assum
 | OI-01 | Exact feed product and service configuration | Confirm multicast groups, ports, re-request servers, entitlement, maximum packet size, request limits, and retention window with the actual provider. |
 | OI-02 | Snapshot/recovery service | Confirm whether GLIMPSE or another service is available, its snapshot format, synchronization marker semantics, and cutover procedure. |
 | OI-03 | Recovery buffering and timeout parameters | Select buffer capacity, reorder window, timeout, retry policy, and snapshot escalation behaviour from measured traffic and service limits. |
-| OI-04 | Physical AXI4-Stream packing | Define the mapping of the serialized 59-byte logical event image to `TDATA` byte lanes, endianness at the lane boundary, and exact `TKEEP`/`TLAST` implementation in `hardware_architecture.md`. |
+| OI-04 | AXI4-Stream packing conformance | Implement the canonical MSB-first serialized-byte mapping from Section 9.5 in `hardware_architecture.md`; verify `TDATA` lanes, `TKEEP`, `TLAST`, padding, and ARM/RTL golden vectors. The logical byte order and lane convention are specified here. |
 | OI-05 | Processing-report interface | Define report queue depth, report encoding, sequence-progress watermark, timeout, and the precise `B` barrier protocol. |
 | OI-06 | Match Number ledger identity and persistence | Confirm provider-specific Match Number namespace behaviour (especially `P` session-unique versus `E`/`C` day-unique); size the DDR hash table; define collision handling, retention, archival, restart persistence, and daily rollover. |
 | OI-07 | Snapshot transfer interface | Define snapshot entry layout, loading protocol, checksum algorithm/coverage, completion signalling, and interaction with normal event ingress. |
@@ -1396,9 +1490,10 @@ The following items remain open after consolidation. They are not silently assum
 
 The official specifications take precedence over this project's summaries if a discrepancy is found.
 
-1. Nasdaq, **TotalView-ITCH 5.0 Interface Specification**: https://www.nasdaqtrader.com/content/technicalsupport/specifications/dataproducts/NQTVITCHSpecification_5.0.pdf
-2. Nasdaq, **MoldUDP64 Protocol Specification, Version 1.00**: https://nasdaqtrader.com/content/technicalsupport/specifications/dataproducts/moldudp64.pdf
-3. AMD/Xilinx AXI4-Stream, Zynq-7000, and 7-series documentation: consult the documents matching the selected Vivado release and Zynq-7020 device when the hardware interface is frozen.
+1. Nasdaq, **TotalView-ITCH 5.0 Interface Specification** (Nasdaq Trader-hosted copy): https://www.nasdaqtrader.com/content/technicalsupport/specifications/dataproducts/NQTVITCHSpecification_5.0.pdf
+2. Nasdaq, **TotalView-ITCH 5.0 Interface Specification** (PDF dated 14 September 2026): https://assets.ctfassets.net/mx0rke14e5yt/5Uz6MGJxbo4wRPou8KveFs/0c3143e52b4e9e586db7d9194c444326/9-14-26_TVITCH_5.0.pdf
+3. Nasdaq, **MoldUDP64 Protocol Specification, Version 1.00**: https://nasdaqtrader.com/content/technicalsupport/specifications/dataproducts/moldudp64.pdf
+4. AMD/Xilinx AXI4-Stream, Zynq-7000, and 7-series documentation: consult the documents matching the selected Vivado release and Zynq-7020 device when the hardware interface is frozen.
 
 ------------------------------------------------------------------------
 
