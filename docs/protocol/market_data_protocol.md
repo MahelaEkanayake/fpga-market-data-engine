@@ -1,401 +1,1332 @@
 # Market Data Protocol Specification
 
-**Project:** FPGA-Accelerated Real-Time Financial Market Data Processing Engine  
-**Document:** `market_data_protocol.md`  
-**Status:** Working draft — Decisions 1–80 captured  
-**Revision:** Draft 0.2
+**Project:** FPGA-Accelerated Real-Time Financial Market Data Processing
+Engine\
+**Document:** `market_data_protocol.md`\
+**Version:** 0.3 (Consolidated Protocol Draft)  
+**Status:** Consolidated working draft — agreed protocol decisions incorporated; feed-specific and interface details remain open  
+**Date:** 24 November 2026
 
----
+------------------------------------------------------------------------
 
-## 1. Purpose and scope
+## Document Control
 
-This document records the agreed protocol and interface decisions for the market-data consumer. The system receives exchange-published market-data messages, reconstructs an order book, calculates market analytics, and reports status and diagnostics.
-
-> **Scope boundary:** This project is a market-data consumer, not an exchange matching engine. It reconstructs the displayed order book from published feed events; it does not match customer orders or execute trades.
-
-The initial scope is one instrument and one order book. Multiple instruments and feed support may be considered later.
-
-### 1.1 Protocol layering
-
-| Layer | Selected technology | Responsibility |
-|---|---|---|
-| Feed delivery | UDP multicast | Delivers feed packets to subscribers. |
-| Transport framing and sequencing | MoldUDP64 | Carries session information, starting sequence number, message count, and length-prefixed messages. |
-| Market-data message format | Nasdaq TotalView-ITCH 5.0 | Defines message types, fields, and market-data semantics. |
-| ARM-to-FPGA event interface | AXI4-Stream | Transfers normalized events from ARM to FPGA. |
-| FPGA control and status | AXI4-Lite | Configuration, status, recovery control, and diagnostics. |
-
-ITCH defines the market-data message semantics. MoldUDP64 defines the UDP delivery framing and packet-level sequencing. These are separate protocol layers.
-
-### 1.2 Initial message scope
-
-The initial implementation focuses on order-book messages and essential market-status/instrument messages required by the selected feed scope.
-
-| ITCH message | Purpose |
+| Item | Description |
 |---|---|
-| `A` | Add Order (no MPID attribution) |
-| `F` | Add Order with MPID attribution |
-| `E` | Order Executed |
-| `C` | Order Executed With Price |
-| `X` | Order Cancel |
-| `D` | Order Delete |
-| `U` | Order Replace |
-| `P` | Trade (Non-Cross) |
+| Document purpose | Define the market-data protocol and the boundary between the ARM Processing System (PS) and FPGA Programmable Logic (PL). |
+| Target feed | Nasdaq TotalView-ITCH 5.0 |
+| Transport / delivery | UDP multicast with MoldUDP64 framing and sequencing |
+| Initial instrument scope | One selected instrument |
+| Primary implementation split | ARM handles network/feed protocol processing; FPGA handles order-book reconstruction and analytics |
+| Related documents | `system_requirements.md`, `hardware_architecture.md`, `order_book_design.md`, `verification_plan.md` |
 
-The exact supported message subset and treatment of additional system/status messages must be finalized against the selected ITCH specification and implementation requirements.
+### Status conventions
 
-### 1.3 Important market-data semantics
+This document distinguishes three kinds of statements:
 
-- The order book stores active displayed orders. The matching engine is outside this project's scope.
-- `A`/`F` adds a displayed order.
-- `X` reduces an order's remaining quantity.
-- `D` removes the remaining quantity of an order.
-- `U` replaces an existing order using a new order reference number and replacement attributes.
-- `E` and eligible `C` messages reduce the resting order quantity because an execution occurred.
-- `P` represents a non-cross trade that is not associated with a displayed order; it may contribute to trade analytics but does not add or remove a displayed order.
-- VWAP is based on eligible executed-trade data, not outstanding order quantity.
-- Execution and trade messages must be interpreted according to ITCH semantics so trade volume and VWAP are not double-counted. Non-printable execution cases must be handled according to the feed specification.
-- ITCH price fields use integer representation with implied decimal precision. Use integer arithmetic rather than floating-point arithmetic.
-- ITCH fields are encoded in network byte order (big-endian).
-- ITCH timestamps and local packet-reception timestamps are distinct. Local reception time is initially captured on the ARM side.
+- **Protocol fact:** Defined by the Nasdaq ITCH or MoldUDP64 specifications.
+- **Project decision:** A choice made for this implementation.
+- **Open item:** A point that must be verified or decided before implementation is frozen.
 
----
+This consolidated engineering draft is not a substitute for
+the official feed specifications or the feed-specific operational
+documentation supplied by a market-data provider.
 
-## 2. Protocol and feed design decisions
+------------------------------------------------------------------------
 
-### 2.1 Protocol selection and message scope — Decisions 1–4
+# 1. Introduction
 
-| No. | Agreed decision | Implementation note |
-|---:|---|---|
-| 1 | Nasdaq TotalView-ITCH 5.0 | Use a documented, established market-data message format. |
-| 2 | UDP multicast with MoldUDP64 | Use multicast for feed delivery and MoldUDP64 for packet framing and sequencing. |
-| 3 | Core order-book messages plus essential market-status/instrument messages | Implement the subset needed for the initial single-instrument consumer. |
-| 4 | Skip unsupported but correctly framed messages | Preserve feed progression. Handle malformed or truncated data separately. |
+## 1.1 Purpose
 
-### 2.2 Instrument selection and book lifecycle — Decisions 5–8
+The purpose of this document is to define the market-data protocol used
+by the FPGA-Accelerated Real-Time Financial Market Data Processing
+Engine.
 
-| No. | Agreed decision | Implementation note |
-|---:|---|---|
-| 5 | ARM-side instrument filtering | Filter after transport-level sequencing and required feed-level processing. |
-| 6 | One active instrument initially | Maintain one active instrument and one order book in the first implementation. |
-| 7 | Support runtime instrument switching | Allow the selected instrument to be changed while running. |
-| 8 | Reconstruct the book after an instrument switch | Obtain a synchronized snapshot/reconstruction before declaring the new book valid. |
+The system receives exchange-published market-data messages, interprets
+order and trade events, reconstructs the displayed order book for a
+selected instrument, and calculates market analytics.
 
-### 2.3 Sequence tracking and recovery — Decisions 9–16
+This document describes the selected feed protocol, packet framing,
+message formats, data encoding, message interpretation, sequence
+management, recovery considerations, and the normalized event interface
+between the ARM processor and FPGA.
 
-| No. | Agreed decision | Implementation note |
-|---:|---|---|
-| 9 | Support incremental and snapshot recovery | Use feed-supported incremental recovery where available; snapshot recovery is the fallback. |
-| 10 | Preserve the existing book but mark it invalid during recovery | Old state may remain available for diagnostics, but must not be represented as current and valid. |
-| 11 | Display stale analytics with an explicit status | Host software may show last-known analytics only when clearly marked stale/invalid. |
-| 12 | Preserve feed sequence information in normalized events | Keep sequence information associated with each event from ARM to FPGA. |
-| 13 | Detect and discard confirmed duplicates | Never apply a duplicate message to the order book more than once. |
-| 14 | Buffer out-of-order messages | Use a bounded reorder buffer and a defined timeout/window. |
-| 15 | Configurable recovery timeout | Any initial timeout value is provisional and must be validated through testing. |
-| 16 | Use snapshot recovery after recovery-buffer overflow | Invalidate the book and use snapshot recovery if the recovery buffer overflows. |
+## 1.2 Scope
 
-**Feed-specific caveat:** Incremental recovery, snapshot synchronization, duplicate handling, and reordering rules must be validated against the actual feed/recovery service. Do not assume a generic snapshot cutover rule.
+The initial implementation focuses on one selected instrument using
+Nasdaq TotalView-ITCH 5.0 message semantics and MoldUDP64 delivery
+framing.
 
-### 2.4 Validation, timestamps, and normalized events — Decisions 17–20
+The protocol-processing scope includes:
 
-| No. | Agreed decision | Implementation note |
-|---:|---|---|
-| 17 | Two-level validation | ARM performs comprehensive protocol/message validation; FPGA defensively validates normalized events and order-book operations. |
-| 18 | Keep local reception timestamp on ARM initially | Keep local receive time distinct from the exchange timestamp. |
-| 19 | Fixed numeric event-type codes | Define a stable numeric code map for normalized event types. |
-| 20 | Reject invalid FPGA event codes and increment a counter | Invalid codes must not modify the order book; record the condition in diagnostics. |
+-   Receiving UDP multicast datagrams.
+-   Decoding MoldUDP64 downstream packet headers and message blocks.
+-   Tracking the feed session and message sequence.
+-   Detecting missing, duplicate, or unexpected messages.
+-   Parsing the selected ITCH 5.0 message types.
+-   Filtering messages for the selected instrument without bypassing
+    feed-level sequence processing.
+-   Converting supported ITCH messages into normalized internal events.
+-   Coordinating recovery when feed continuity or order-book validity is
+    lost.
+-   Transferring normalized events from the ARM to the FPGA.
 
-### 2.5 ARM–FPGA event transfer and validity ownership — Decisions 21–26
+The FPGA order-book data structures, detailed memory organization, register map, diagnostic subsystem implementation, interrupt topology, and RTL microarchitecture are outside the detailed scope of this document. They belong in `hardware_architecture.md` and `order_book_design.md`. This document specifies only the market-data protocol behaviour and the logical ARM–FPGA event contract.
 
-| No. | Agreed decision | Implementation note |
-|---:|---|---|
-| 21 | AXI-Stream handshake confirms transfer; processing status is separate | A transfer is accepted on `TVALID && TREADY`; this does not confirm successful order-book processing. |
-| 22 | FPGA order-book errors trigger invalidation and recovery handling | A consistency error may invalidate the book and require recovery or investigation. |
-| 23 | Separate error counters | Maintain distinct protocol, sequence, order-book, and other relevant error counters. |
-| 24 | AXI4-Lite diagnostic registers plus interrupts | Use registers for status/details and interrupts for important notifications. |
-| 25 | ARM owns `FEED_VALID`; FPGA owns `BOOK_VALID` | ARM is authoritative for feed validity; FPGA independently tracks book validity. |
-| 26 | Continuous event streaming; do not wait for per-event processing completion | Preserve event order and stream while AXI-Stream permits. Monitor processing status separately. |
+## 1.3 System boundary
 
----
+The system is a **market-data consumer**. It reconstructs market state
+from events published by the feed.
 
-## 3. In-flight event handling and snapshot recovery
+It is not an exchange matching engine and does not: - Accept customer
+orders. - Submit orders to an exchange. - Match incoming customer orders
+against resting orders. - Execute trades. - Provide brokerage or
+exchange infrastructure.
 
-### 3.1 In-flight event handling — Decision 27
+## 1.4 Proposed processing split
 
-| No. | Agreed decision | Implementation note |
-|---:|---|---|
-| 27 | Stop book updates after an event-processing failure | Invalidate the book and discard or quarantine subsequent in-flight events so later events cannot compound a state error. |
+The initial architecture assigns feed and network responsibilities to the ARM PS and order-book computation to the FPGA PL.
 
-### 3.2 Snapshot synchronization and loading — Decisions 28–31
-
-| No. | Agreed decision | Implementation note |
-|---:|---|---|
-| 28 | Snapshot includes an explicit synchronization sequence number | Define it as the **last event already included** in the snapshot. The first event applied afterward is `recovery_sequence + 1`. |
-| 29 | Dedicated snapshot-loading interface or memory region | Keep bulk snapshot initialization separate from the normal AXI-Stream event path. |
-| 30 | Validate snapshot entry count and checksum | FPGA verifies the expected entry count and an independently calculated checksum. |
-| 31 | ARM and FPGA independently calculate the snapshot checksum | Independent calculations help detect transfer corruption. The algorithm and covered fields remain to be defined. |
-
-### 3.3 Snapshot status reporting — Decision 32
-
-| No. | Agreed decision | Implementation note |
-|---:|---|---|
-| 32 | AXI4-Lite status registers plus interrupt notification | FPGA reports snapshot status through registers and notifies ARM on success/failure. ARM must read status; an interrupt alone does not imply success. |
-
-Suggested snapshot status information: state, expected and received entry counts, calculated checksum, recovery sequence number, and error code. The exact register map is a later interface-design task.
-
----
-
-## 4. Interrupt architecture and diagnostic counters
-
-### 4.1 Interrupt architecture and acknowledgement — Decisions 33–36
-
-| No. | Agreed decision | Implementation note |
-|---:|---|---|
-| 33 | Dedicated interrupt signal for each event type | Use separate interrupt lines instead of one shared interrupt. Finalize the complete list later. |
-| 34 | ARM explicitly acknowledges interrupts through a clear register | Keep each interrupt asserted until acknowledged. Clearing one source must not clear unrelated sources. |
-| 35 | Defer non-critical errors until recovery reaches a safe point | Critical errors may abort recovery when necessary. |
-| 36 | Independent pending-status bit for each interrupt source | Multiple pending sources must not overwrite one another. |
-
-### 4.2 Interrupt counters — Decisions 37–40
-
-| No. | Agreed decision | Implementation note |
-|---:|---|---|
-| 37 | Maintain an event counter for each interrupt source | Count repeated occurrences even if ARM has not yet serviced the source. |
-| 38 | Cumulative counters | Counters continue accumulating until explicitly reset. Acknowledgement does not reset them. |
-| 39 | Individual counter-reset commands | ARM can reset selected counters independently through AXI4-Lite. |
-| 40 | 32-bit saturating counters | Counters stop at `0xFFFFFFFF` rather than wrapping to zero. |
-
----
-
-## 5. Diagnostic event history and FIFO
-
-### 5.1 Diagnostic history and FIFO capacity — Decisions 41–43
-
-| No. | Agreed decision | Implementation note |
-|---:|---|---|
-| 41 | Maintain a hardware diagnostic FIFO | Store event type, order ID where applicable, feed sequence number where applicable, and FPGA timestamp. |
-| 42 | 256 diagnostic entries | Initial FIFO capacity is 256 records. |
-| 43 | Initially selected: overwrite the oldest record when full | **Superseded by Decision 49.** The current policy is to preserve existing records and reject new records when full. |
-
-### 5.2 Diagnostic transfer and buffering — Decisions 44–48
-
-| No. | Agreed decision | Implementation note |
-|---:|---|---|
-| 44 | AXI DMA (S2MM) to transfer records to ARM-accessible DDR | Avoid reading every diagnostic record through individual AXI4-Lite accesses. |
-| 45 | Threshold-based DMA trigger | Start a transfer at a configurable occupancy threshold; initial threshold is 64 records. |
-| 46 | Transfer all currently available records in the captured batch | Capture a consistent batch boundary. Records arriving afterward belong to a subsequent batch. |
-| 47 | Double buffering in DDR | DMA fills one buffer while ARM processes the other. |
-| 48 | Backpressure when both DDR buffers are occupied | Stop consuming FIFO records until a buffer becomes available. |
-
-### 5.3 FIFO full policy and loss counter — Decisions 49–50
-
-| No. | Agreed decision | Implementation note |
-|---:|---|---|
-| 49 | Reject new records when the diagnostic FIFO is full | Preserve existing records. This supersedes Decision 43's overwrite-oldest policy. |
-| 50 | Cumulative, saturating, independently resettable 32-bit diagnostic-loss counter | Increment whenever a new diagnostic record is rejected because the FIFO is full. Do not reset automatically when DMA resumes. |
-
----
-
-## 6. Diagnostic record format and BRAM-to-DMA datapath
-
-### 6.1 Diagnostic record format and storage — Decisions 51–53
-
-| No. | Agreed decision | Implementation note |
-|---:|---|---|
-| 51 | Fixed-size diagnostic records | Every record uses the same structure and width. |
-| 52 | 256-bit (32-byte) diagnostic record | Field allocation is shown in the table below. |
-| 53 | Implement the diagnostic FIFO using BRAM | Confirm actual BRAM mapping and resource use in Vivado synthesis. |
-
-#### Diagnostic record layout
-
-| Field | Width | Purpose |
-|---|---:|---|
-| Error/event type | 8 bits | Identifies the diagnostic event. |
-| Order ID | 64 bits | Identifies the affected order, where applicable. |
-| Feed sequence number | 64 bits | Identifies the associated market event, where applicable. |
-| FPGA timestamp | 64 bits | Records when the event occurred. |
-| Reserved/future fields | 56 bits | Future expansion and event-specific information. |
-| **Total** | **256 bits** | **32 bytes per record.** |
-
-The event-specific meaning and validity of each field must be documented. Some event types may not use the order ID or feed sequence fields.
-
-### 6.2 BRAM-to-AXI-Stream path — Decisions 54–56
-
-| No. | Agreed decision | Implementation note |
-|---:|---|---|
-| 54 | Custom FIFO-to-AXI-Stream controller | Custom RTL reads diagnostic records from BRAM and streams them into AXI DMA. |
-| 55 | 256-bit AXI-Stream data width | One diagnostic record per beat. Use `TDATA[255:0]`, `TVALID`, `TREADY`, `TLAST`, and `TKEEP[31:0]`. |
-| 56 | Dedicated hardware interface for DMA completion status | Controller receives DMA completion/error status through hardware. Verify the exact available interface in the selected AXI DMA IP configuration. |
-
-**AXI-Stream behaviour:** The controller must hold `TVALID` and `TDATA` stable while `TREADY` is low. It must not advance the FIFO read pointer until the beat is accepted (`TVALID && TREADY`). `TLAST` marks the final beat of a DMA transaction. For a full 32-byte record, all `TKEEP` bits are asserted.
-
-### 6.3 DMA failure and retry policy — Decisions 57–60
-
-| No. | Agreed decision | Implementation note |
-|---:|---|---|
-| 57 | Retry the entire DMA transaction after a transfer failure | Retain the original records until a successful transfer is confirmed. ARM must not process a partial DDR write as a valid batch. |
-| 58 | Maximum of three total DMA attempts | Three attempts means one initial attempt plus at most two retries. |
-| 59 | After three failed attempts, disable further DMA transactions but continue capture into BRAM | Preserve records until the FIFO becomes full; then apply Decision 49 and count rejected records. |
-| 60 | Require explicit ARM intervention to re-enable DMA | ARM investigates and issues a re-enable command through AXI4-Lite. FPGA verifies that the DMA interface is ready. |
-
----
-
-## 7. Diagnostic DMA batches and integrity
-
-### 7.1 Batch identity and metadata — Decisions 61–64
-
-| No. | Agreed decision | Implementation note |
-|---:|---|---|
-| 61 | Unique, incrementing batch ID for each logical transaction | Retries retain the same batch ID; a new logical batch receives a new ID. |
-| 62 | 64-bit batch ID | Do not silently wrap or reuse IDs. Define a safe exhaustion/reinitialization procedure. |
-| 63 | Transfer batch metadata in a header alongside diagnostic records | ARM receives metadata and its associated records together in DDR. |
-| 64 | 256-bit (32-byte) batch header | Proposed field allocation is shown below. |
-
-#### Proposed batch header layout
-
-| Field | Width | Purpose |
-|---|---:|---|
-| Batch ID | 64 bits | Identifies the logical transaction. |
-| Record count | 16 bits | Number of diagnostic records in the batch. |
-| Attempt number | 8 bits | Identifies the transfer attempt. |
-| Transaction status | 8 bits | Encoded transaction state. |
-| Timestamp | 64 bits | Batch creation timestamp. |
-| CRC-32 | 32 bits | Batch integrity value. |
-| Reserved | 64 bits | Future extension. |
-| **Total** | **256 bits** | **32 bytes per header.** |
-
-**Header validity caveat:** A header transferred at the beginning cannot, by itself, prove that the complete batch arrived. Define a separate completion/validity indication associated with successful DMA completion and ARM verification.
-
-### 7.2 Batch integrity — Decisions 65–66
-
-| No. | Agreed decision | Implementation note |
-|---:|---|---|
-| 65 | Calculate and verify CRC-32 for every DMA batch | FPGA calculates the checksum; ARM independently recalculates it after receiving the batch. |
-| 66 | CRC-32/ISO-HDLC | Use the standard variant with the parameters below. |
-
-#### CRC-32/ISO-HDLC parameters
-
-| Parameter | Value |
+| Component | Primary responsibilities |
 |---|---|
-| Polynomial (normal representation) | `0x04C11DB7` |
-| Initial value | `0xFFFFFFFF` |
-| Reflected input/output | Yes |
-| Final XOR | `0xFFFFFFFF` |
+| ARM PS | UDP reception, MoldUDP64 decoding, feed-session and sequence handling, ITCH parsing, instrument filtering, event normalization, recovery coordination, Match Number ledger in DDR, host communication |
+| FPGA PL | Normalized-event acceptance, order-book reconstruction, best bid/ask and selected analytics, book-validity reporting, trade-contribution reports and processing progress reporting |
+| Host application | Configuration, monitoring, visualization, logging and performance measurement |
 
-The checksum coverage must be defined precisely. Current intent is to cover the relevant batch metadata and diagnostic records while excluding the checksum field itself (or treating it as zero during calculation). Exact byte order and test vectors remain to be specified.
+For eligible `E` executions, the FPGA obtains the effective execution price from the referenced resting order and reports the accepted trade contribution to the ARM. The ARM maintains the Match Number ledger required to process later `B` messages. The ordering barrier required before a broken-trade correction is described in Sections 6 and 9.
 
----
+This split is a project architecture decision, not a requirement imposed by ITCH.
 
-## 8. Batch acknowledgement, retransmission, and diagnostic reset
+## 1.5 Terminology
 
-### 8.1 Batch ownership and acknowledgement — Decisions 67–70
+| Term | Meaning |
+|---|---|
+| ITCH | Nasdaq TotalView-ITCH application-level market-data message protocol |
+| MoldUDP64 | UDP-based delivery protocol that frames, sequences, and supports re-request of messages |
+| Session | A logical sequence of messages identified by the MoldUDP64 session field |
+| Message sequence number | Sequence assigned by MoldUDP64 to an individual message in a session |
+| Stock Locate | Feed-provided instrument identifier used in ITCH messages |
+| Order Reference Number | Feed-provided identifier for an order |
+| Match Number | Feed-provided identifier associated with an execution |
+| PS | Zynq Processing System, containing the ARM processor |
+| PL | FPGA Programmable Logic |
+| Normalized event | Project-defined representation of a parsed ITCH message for FPGA processing |
+| Book validity | Whether the reconstructed order book is believed to represent a continuous, correctly applied feed state |
 
-| No. | Agreed decision | Implementation note |
-|---:|---|---|
-| 67 | Retain FIFO records until ARM confirms successful CRC verification | DMA completion alone does not release records. |
-| 68 | ARM acknowledges a batch by writing its 64-bit batch ID to an AXI4-Lite register | FPGA verifies the ID matches the outstanding batch before releasing associated records. |
-| 69 | ARM explicitly requests retransmission after CRC verification failure | Request includes the batch ID; FPGA verifies it and retransmits the original batch. |
-| 70 | Maximum of three CRC-verification attempts per batch | After three unsuccessful attempts, raise a fatal diagnostic-integrity error, preserve records, stop automatic retransmission, and wait for ARM intervention. |
+------------------------------------------------------------------------
 
-DMA transfer retries (Decision 58) and CRC-verification attempts (Decision 70) are separate mechanisms.
+# 2. Protocol Selection
 
-### 8.2 Diagnostic recovery and reset — Decisions 71–76
+## 2.1 Application protocol: Nasdaq TotalView-ITCH 5.0
 
-| No. | Agreed decision | Implementation note |
-|---:|---|---|
-| 71 | ARM-controlled recovery after a fatal integrity error | ARM investigates, issues a recovery command, and requests retransmission of the retained batch. No full FPGA reset is required. |
-| 72 | Independent software-controlled diagnostic subsystem reset through AXI4-Lite | Reset diagnostic control/DMA state without resetting the order-book engine, market-data processing, or feed sequence tracking. |
-| 73 | Require a predefined reset key | Proposed key: `0xD1A60001`. FPGA validates the key before initiating reset. |
-| 74 | Dedicated reset-completion interrupt | Raise `IRQ_DIAGNOSTIC_RESET_COMPLETE`; ARM reads reset status and acknowledges the interrupt. |
-| 75 | Preserve cumulative diagnostic counters across diagnostic subsystem resets | Only explicit individual counter-reset commands clear counters. |
-| 76 | Preserve diagnostic FIFO contents across diagnostic subsystem resets | Separate FIFO memory from control reset; ensure pointers and occupancy remain consistent and records remain accessible. |
+**Project decision:** Use Nasdaq TotalView-ITCH 5.0 as the source
+message format for the initial implementation.
 
-### 8.3 Outstanding batch and reset continuity — Decisions 77–80
+ITCH is an outbound market-data protocol. It communicates information
+about orders, executions, trades, instruments and market events. It is
+not an order-entry protocol.
 
-| No. | Agreed decision | Implementation note |
-|---:|---|---|
-| 77 | Mark outstanding DMA batch as interrupted during reset and retransmit it afterward | Preserve the original batch ID and diagnostic records. ARM must not accept an uncertain/partial pre-reset transfer as complete. |
-| 78 | Preserve the 64-bit batch ID counter across diagnostic subsystem resets | Interrupted batches retain their original ID; subsequent new batches continue with the next ID. |
-| 79 | Record diagnostic subsystem resets in the diagnostic event history | Add a special reset record with reason, timestamp, reset identifier, and related batch ID where applicable. Record it after FIFO control is operational again. |
-| 80 | Use fixed enumerated reset-reason codes | Use stable numeric codes instead of free-form values. The provisional codes are listed below. |
+The protocol is suitable for this project because it provides
+order-level events that can be applied sequentially to reconstruct a
+displayed order book.
 
-#### Provisional reset reason codes
+The ITCH specification defines message content and semantics. It does
+not, by itself, define the network delivery and sequencing mechanism
+used by every feed deployment.
 
-| Code | Reset reason |
+## 2.2 Delivery protocol: MoldUDP64
+
+**Project decision:** Use MoldUDP64 as the initial delivery/framing
+protocol over UDP multicast.
+
+MoldUDP64 supports one transmitter sending a sequenced data stream to
+multiple listeners. It provides: - A session identifier. - A sequence
+number for the first message in each downstream packet. - A message
+count. - Length-prefixed message blocks. - Heartbeat packets. - A
+request mechanism for retransmission of missing messages.
+
+MoldUDP64 does not make UDP itself reliable. The receiver must detect
+gaps and use the feed's configured re-request service and recovery
+procedures.
+
+## 2.3 Protocol alternatives
+
+Nasdaq's TotalView-ITCH 5.0 specification identifies multiple delivery
+options, including SoupBinTCP and MoldUDP64. This project selects
+MoldUDP64 for the initial UDP multicast design.
+
+SoupBinTCP is not part of the initial implementation. It may be
+considered later as an alternative feed-delivery path or for a separate
+recovery/failover design, subject to the actual service configuration.
+
+## 2.4 Protocol layering
+
+The conceptual receive stack is:
+
+``` text
++--------------------------------------+
+| Project market-data consumer         |
++--------------------------------------+
+| Nasdaq TotalView-ITCH 5.0 messages   |
++--------------------------------------+
+| MoldUDP64 downstream packet framing  |
++--------------------------------------+
+| UDP                                  |
++--------------------------------------+
+| IP multicast                         |
++--------------------------------------+
+| Ethernet                             |
++--------------------------------------+
+```
+
+Responsibilities are separated as follows:
+
+| Layer | Responsibility |
+|---|---|
+| Ethernet / IP / UDP | Network delivery of UDP datagrams |
+| MoldUDP64 | Session identification, message framing, sequence information, heartbeat, and re-request support |
+| ITCH 5.0 | Meaning and binary layout of market-data messages |
+| Project normalization | Convert selected ITCH messages into the project's internal event representation |
+
+**Important:** The MoldUDP64 sequence number belongs to the delivery
+layer. It is not a field carried inside each ITCH message.
+
+------------------------------------------------------------------------
+
+# 3. MoldUDP64 Packet Format
+
+## 3.1 Downstream packet structure
+
+A MoldUDP64 downstream packet consists of a fixed 20-byte header
+followed by zero or more message blocks.
+
+``` text
++-------------------------------+
+| Session             10 bytes  |
++-------------------------------+
+| Sequence Number      8 bytes  |
++-------------------------------+
+| Message Count        2 bytes  |
++-------------------------------+
+| Message Block 1                |
+|   Message Length     2 bytes  |
+|   Message Data       variable |
++-------------------------------+
+| Message Block 2                |
+|   Message Length     2 bytes  |
+|   Message Data       variable |
++-------------------------------+
+| ...                           |
++-------------------------------+
+```
+
+### 3.1.1 Downstream header
+
+| Field | Offset | Length | Description |
+|---|---:|---:|---|
+| Session | 0 | 10 bytes | Identifies the MoldUDP64 session |
+| Sequence Number | 10 | 8 bytes | Sequence number of the first message in this packet |
+| Message Count | 18 | 2 bytes | Number of message blocks in the packet |
+| **Total** | **0** | **20 bytes** | Fixed header length |
+
+MoldUDP64 numeric fields are binary big-endian values.
+
+## 3.2 Message blocks
+
+Each message block contains:
+
+| Field | Length | Description |
+|---|---:|---|
+| Message Length | 2 bytes | Unsigned byte count of the message data that follows |
+| Message Data | Variable | Application-level message; in this project, an ITCH message |
+
+The two-byte message-length field does **not** include its own two
+bytes.
+
+The first message block starts immediately after the 20-byte downstream
+header. Subsequent blocks follow directly after the preceding block.
+
+The receiver must use the message count and each message-length field to
+walk the packet safely. It must not assume that all ITCH messages have
+the same length.
+
+## 3.3 Sequence numbering
+
+The downstream packet header's sequence number identifies the first
+message in the packet.
+
+If a packet contains multiple messages, the messages are numbered
+consecutively. For example:
+
+``` text
+Packet header:
+    Sequence Number = 100
+    Message Count   = 3
+
+Message blocks:
+    Message 1 -> sequence 100
+    Message 2 -> sequence 101
+    Message 3 -> sequence 102
+```
+
+The receiver maintains the next expected message sequence number for the
+active session.
+
+Sequence tracking must occur for the complete feed stream before
+filtering messages for the selected instrument. Otherwise, messages for
+other instruments could be mistaken for missing feed messages.
+
+## 3.4 Heartbeats and end of session
+
+MoldUDP64 defines special message-count values:
+
+| Message Count | Meaning |
 |---:|---|
-| `0x01` | DMA fatal error |
-| `0x02` | CRC verification failure |
-| `0x03` | ARM-requested reset |
-| `0x04` | Internal diagnostic controller fault |
-| `0x05` | DMA interface fault |
-| `0x06` | Other hardware-detected fault |
+| `0` | Heartbeat packet |
+| `0xFFFF` | End-of-session packet |
+| Other values | Number of message blocks in the packet |
 
-These codes are provisional and should be finalized with the register map and RTL definitions.
+Heartbeat packets contain no message blocks and carry the next expected
+sequence number. They allow a receiver to detect a gap even when normal
+market activity is low.
 
----
+End-of-session packets indicate that the current session has ended. The
+receiver must treat a session transition as a feed lifecycle event and
+must not assume sequence continuity across unrelated sessions.
 
-## 9. Known open points and consistency checks
+## 3.5 Re-request packets
 
-The following points must be resolved before treating this document as an implementation-ready specification.
+A receiver can request retransmission by sending a MoldUDP64 request
+packet to the configured re-request server.
 
-| ID | Open point | Required follow-up |
+The request packet contains: - Session: 10 bytes. - First requested
+sequence number: 8 bytes. - Requested message count: 2 bytes.
+
+A valid response is a downstream packet sent by unicast to the
+requester. If the requested range cannot fit in one response packet,
+further requests may be needed.
+
+The exact re-request server addresses, ports, request limits, retention
+window and operational rules are feed-deployment configuration items.
+They must not be invented by the receiver implementation.
+
+------------------------------------------------------------------------
+
+# 4. ITCH 5.0 Data Encoding
+
+## 4.1 Integer byte order
+
+ITCH integer fields are binary encoded using **big-endian (network byte
+order)**. Unless a field is explicitly described otherwise, integer
+fields are unsigned.
+
+For a four-byte value:
+
+``` text
+Bytes:       00 0F 42 40
+Interpret:   0x000F4240
+Decimal:     1,000,000
+```
+
+The parser must convert multi-byte fields consistently before using them
+in the internal representation.
+
+## 4.2 Alpha fields
+
+Alpha fields are ASCII character fields. They are left-justified and
+padded on the right with spaces where specified.
+
+The parser must not assume that a space-padded symbol is a
+null-terminated C string.
+
+## 4.3 Prices
+
+ITCH price fields are integer values with an implied decimal precision.
+A `Price (4)` field has four implied decimal places.
+
+For example:
+
+``` text
+Raw integer price: 1,005,000
+Precision:         4 decimal places
+Displayed price:   100.5000
+```
+
+**Implementation rule:** Keep prices as integers in the protocol parser
+and FPGA event interface. Do not convert prices to binary floating-point
+values for order-book comparisons.
+
+The project must document the selected price scale and use it
+consistently in comparisons, analytics and host display conversion.
+
+## 4.4 Timestamps
+
+ITCH timestamps are represented as nanoseconds since midnight.
+
+The ITCH timestamp is an exchange/feed timestamp. It is not the same as
+the local packet-reception timestamp measured by the ARM.
+
+The implementation should keep these concepts separate: - Exchange
+timestamp from the ITCH message. - Local receive timestamp captured by
+the host/ARM for latency and diagnostics.
+
+The local receive timestamp's clock source and synchronization accuracy
+belong in the system architecture/performance specification.
+
+## 4.5 Instrument identifiers
+
+ITCH messages contain a Stock Locate field. Nasdaq assigns locate codes
+dynamically each day, communicates them through Stock Directory
+messages, and keeps a locate code stable intraday. The same locate code
+must not be assumed to identify the same instrument on a different
+trading day.
+
+The receiver should use the Stock Directory information and the feed's
+daily mapping to associate a Stock Locate value with the intended
+instrument.
+
+------------------------------------------------------------------------
+
+# 5. Supported ITCH Message Types
+
+## 5.1 Initial message selection
+
+The initial implementation supports the following messages:
+
+| Type | Message | Project treatment |
 |---|---|---|
-| O-01 | FIFO full policy | Decision 43 initially selected overwrite-oldest; Decision 49 later selected reject-new/preserve-existing. Decision 49 is the current policy. |
-| O-02 | FIFO retention versus circular FIFO operation | Define how outstanding batch records are retained until ARM acknowledgement while new records are accepted, and how retained records are protected from overwrite. |
-| O-03 | Double-buffer capacity and ownership | Specify DDR buffer sizes, ownership state machine, and buffer-full/backpressure signalling. |
-| O-04 | DMA completion interface | Verify the AXI DMA IP status/interrupt connectivity available in Vivado. |
-| O-05 | DMA batch boundary | Define the snapshot point for “all currently available records”; records arriving during a transfer must belong to the next batch. |
-| O-06 | Partial DMA write handling | Define how ARM invalidates incomplete DDR data and how a retry avoids stale partial data being mistaken for a complete batch. |
-| O-07 | Batch header validity | Define how completion is indicated. A header transferred first cannot alone prove that the full transfer completed. |
-| O-08 | CRC coverage and byte order | Define exact byte coverage, byte order, checksum-field treatment, and CRC test vectors. |
-| O-09 | Reset and retained FIFO state | Define how pointers, occupancy, outstanding metadata, and in-progress transfer state are preserved/reconstructed across reset. |
-| O-10 | Reset event capture | Ensure the reset event is not erased by the reset it records; define when it is inserted after reset. |
-| O-11 | Interrupt list and priority | Finalize sources, critical/non-critical classification, pending-bit behaviour, counter association, and acknowledgement semantics. |
-| O-12 | Diagnostic record field interpretation | Define event-specific meanings and validity rules for reserved bits and fields that may not apply to every event. |
-| O-13 | Snapshot checksum | Choose the algorithm and define the exact snapshot fields covered. |
-| O-14 | Snapshot interface | Specify snapshot interface, framing, completion signalling, and synchronization with normal event ingress. |
-| O-15 | 256-bit AXI-Stream/DMA configuration | Confirm that the selected AXI DMA configuration supports the required data width and byte-lane configuration. |
-| O-16 | Counter semantics | Define whether counters track diagnostic event occurrences, interrupt assertions, or both. |
+| `S` | System Event | Track feed/day lifecycle; `C` (End of Messages) closes the daily stream. |
+| `R` | Stock Directory | Build the current-day Stock Locate-to-symbol mapping. |
+| `H` | Stock Trading Action | Track the selected instrument's trading state. |
+| `A` / `F` | Add Order / Add Order with MPID | Add a displayed order. |
+| `E` | Order Executed | Reduce displayed quantity and contribute to trade statistics. |
+| `C` | Order Executed With Price | Reduce displayed quantity; include in trade statistics only when Printable=`Y`. |
+| `X` | Order Cancel | Reduce displayed quantity; not a trade. |
+| `D` | Order Delete | Remove the remaining displayed quantity. |
+| `U` | Order Replace | Remove the old order reference and add the replacement under the new reference. |
+| `P` | Trade (Non-Cross) | Update trade statistics; no displayed-book update. |
+| `Q` | Cross Trade | Recognize and sequence; exclude from initial trade analytics and do not treat as a displayed-order update. |
+| `B` | Broken Trade | Reverse a previously included `E`, `C`, or `P` trade contribution by Match Number; no book update. |
 
----
+The following known non-core message types are recognized and skipped by the initial application logic when their message framing and lengths are valid. They still consume their normal MoldUDP64 sequence positions.
 
-## 10. Implementation and verification notes
+| Type | Message | Total ITCH message length |
+|---|---|---:|
+| `Y` | Reg SHO Restriction | 20 bytes |
+| `L` | Market Participant Position | 26 bytes |
+| `V` | MWCB Decline Level | 35 bytes |
+| `W` | MWCB Status | 12 bytes |
+| `J` | LULD Auction Collar | 35 bytes |
+| `K` | IPO Quoting Period Update | 28 bytes |
+| `I` | Net Order Imbalance Indicator (NOII) | 50 bytes |
+| `N` | Retail Price Improvement Indicator | 20 bytes |
 
-These decisions define intended behaviour; they are not proof that the design has already been implemented or validated.
+If a known message later proves relevant to selected-instrument state or the chosen analytics, its handling must be added explicitly.
 
-Before RTL sign-off:
+Unknown message types are not silently treated as harmless. The ARM must stop forwarding the affected stream, record the unsupported type, and apply the conservative feed/book-validity policy in Section 10.3 until the message's impact is understood.
 
-1. Verify ITCH 5.0 message layouts and semantics against the official specification.
-2. Verify MoldUDP64 packet framing and sequence handling against the official specification.
-3. Define normalized-event field validity for each event type.
-4. Define AXI-Stream event framing and error-reporting details.
-5. Define AXI4-Lite register addresses, access permissions, reset values, and write-one-to-clear semantics.
-6. Define snapshot transfer framing and checksum test vectors.
-7. Define diagnostic FIFO and DMA state machines, including ownership and retry behaviour.
-8. Build self-checking testbenches for normal transfer, backpressure, FIFO full, DMA failure, CRC failure, retransmission, reset, and interrupted-batch recovery.
-9. Verify synthesis resource usage and timing for the target Vivado version and Zynq-7020 device.
-10. Benchmark the complete system, including ARM parsing, AXI transfer overhead, FPGA processing, and diagnostic activity.
+A correctly framed known message may be skipped for FPGA processing while still being counted for feed sequencing. A malformed or truncated message is a different class of error and must not be skipped as though it were valid.
 
-### 10.1 Key invariants
+## 5.2 Common message prefix
 
-| Invariant | Required behaviour |
+The selected stock-related ITCH messages generally begin with the
+following common fields:
+
+| Field | Offset | Length |
+|---|---:|---:|
+| Message Type | 0 | 1 byte |
+| Stock Locate | 1 | 2 bytes |
+| Tracking Number | 3 | 2 bytes |
+| Timestamp | 5 | 6 bytes |
+
+The remaining fields depend on the message type.
+
+The Tracking Number is a Nasdaq internal tracking field. It is not the
+MoldUDP64 message sequence number.
+
+## 5.3 Add Order --- `A`
+
+An `A` message adds an unattributed displayed order.
+
+| Field | Offset | Length |
+|---|---:|---:|
+| Message Type | 0 | 1 byte |
+| Stock Locate | 1 | 2 bytes |
+| Tracking Number | 3 | 2 bytes |
+| Timestamp | 5 | 6 bytes |
+| Order Reference Number | 11 | 8 bytes |
+| Buy/Sell Indicator | 19 | 1 byte |
+| Shares | 20 | 4 bytes |
+| Stock | 24 | 8 bytes |
+| Price | 32 | 4 bytes |
+| **Total message length** | — | **36 bytes** |
+
+Buy/Sell Indicator values:
+
+| Value | Meaning |
 |---|---|
-| Feed sequence integrity | A sequence gap invalidates feed/book state until feed-specific recovery establishes a valid synchronization point. |
-| Book validity | FPGA must not apply later events after an earlier failure makes the book state unreliable. |
-| Snapshot acceptance | Accept a snapshot only after complete transfer and successful integrity/structural checks. |
-| Snapshot synchronization | Snapshot sequence denotes the last event included; next applied event is sequence plus one. |
-| AXI-Stream transfer | A beat transfers only when `TVALID && TREADY`; producer holds data stable while stalled. |
-| Processing status | Interface transfer acceptance is not the same as successful event processing. |
-| Diagnostic retention | Do not release diagnostic records until ARM acknowledges a CRC-verified batch. |
-| DMA retry | A retry retransmits the same logical batch with the same batch ID. |
-| Diagnostic reset isolation | Diagnostic reset must not reset the order-book engine or feed sequence tracking. |
-| Counter preservation | Diagnostic subsystem reset preserves cumulative counters and the batch ID counter. |
+| `B` | Buy |
+| `S` | Sell |
 
----
+Processing: 1. Identify the instrument. 2. Apply the selected-instrument
+filter. 3. Create an order entry using the Order Reference Number. 4.
+Store side, price and displayed quantity. 5. Update the appropriate side
+of the order book.
 
-## 11. References
+## 5.4 Add Order with MPID Attribution --- `F`
 
-- Nasdaq TotalView-ITCH 5.0 specification: <https://www.nasdaqtrader.com/content/technicalsupport/specifications/dataproducts/NQTVITCHSpecification_5.0.pdf>
-- MoldUDP64 specification: <https://nasdaqtrader.com/content/technicalsupport/specifications/dataproducts/moldudp64.pdf>
+An `F` message has the same fields as `A`, followed by a four-byte
+Attribution field.
 
-Consult the relevant AMD/Xilinx AXI DMA, AXI4-Stream, Zynq-7000, and 7-series documentation when finalizing hardware interfaces and implementation details.
+| Field | Offset | Length |
+|---|---:|---:|
+| Common prefix and order fields | 0–35 | 36 bytes |
+| Attribution | 36 | 4 bytes |
+| **Total message length** | — | **40 bytes** |
+
+The Attribution field identifies the market participant associated with
+the order.
+
+For the initial order-book implementation, `F` may use the same
+order-book update logic as `A`. Attribution can be retained as metadata
+or ignored by the core price/quantity calculations if participant-level
+analytics are not in scope.
+
+## 5.5 Order Executed --- `E`
+
+An `E` message reports a full or partial execution of an order already
+represented in the displayed book.
+
+| Field | Offset | Length |
+|---|---:|---:|
+| Message Type | 0 | 1 byte |
+| Stock Locate | 1 | 2 bytes |
+| Tracking Number | 3 | 2 bytes |
+| Timestamp | 5 | 6 bytes |
+| Order Reference Number | 11 | 8 bytes |
+| Executed Shares | 19 | 4 bytes |
+| Match Number | 23 | 8 bytes |
+| **Total message length** | — | **31 bytes** |
+
+Processing: 1. Find the referenced order. 2. Subtract Executed Shares
+from its remaining displayed quantity. 3. Remove the order if its
+remaining quantity becomes zero. 4. Update execution statistics
+according to the project's defined trade-statistics policy.
+
+The same order may receive multiple execution messages; the effects are
+cumulative.
+
+## 5.6 Order Executed with Price --- `C`
+
+A `C` message reports an execution at a price different from the order's
+original display price.
+
+| Field | Offset | Length |
+|---|---:|---:|
+| Message Type | 0 | 1 byte |
+| Stock Locate | 1 | 2 bytes |
+| Tracking Number | 3 | 2 bytes |
+| Timestamp | 5 | 6 bytes |
+| Order Reference Number | 11 | 8 bytes |
+| Executed Shares | 19 | 4 bytes |
+| Match Number | 23 | 8 bytes |
+| Printable | 31 | 1 byte |
+| Execution Price | 32 | 4 bytes |
+| **Total message length** | — | **36 bytes** |
+
+Printable flag values:
+
+| Value | Meaning |
+|---|---|
+| `Y` | Printable |
+| `N` | Non-printable |
+
+The order-book quantity must be reduced for the execution in either
+case.
+
+For time-and-sales or volume statistics, Nasdaq specifies that
+non-printable executions should be excluded to avoid double counting
+when the shares are represented in a later bulk print. The project must
+apply this rule consistently.
+
+## 5.7 Order Cancel --- `X`
+
+An `X` message represents a partial cancellation.
+
+| Field | Offset | Length |
+|---|---:|---:|
+| Message Type | 0 | 1 byte |
+| Stock Locate | 1 | 2 bytes |
+| Tracking Number | 3 | 2 bytes |
+| Timestamp | 5 | 6 bytes |
+| Order Reference Number | 11 | 8 bytes |
+| Canceled Shares | 19 | 4 bytes |
+| **Total message length** | — | **23 bytes** |
+
+Processing: 1. Find the referenced order. 2. Subtract Canceled Shares
+from its remaining displayed quantity. 3. Remove the order if its
+remaining quantity becomes zero. 4. Do not count a cancellation as a
+trade execution.
+
+## 5.8 Order Delete --- `D`
+
+A `D` message removes an order from the displayed book.
+
+| Field | Offset | Length |
+|---|---:|---:|
+| Message Type | 0 | 1 byte |
+| Stock Locate | 1 | 2 bytes |
+| Tracking Number | 3 | 2 bytes |
+| Timestamp | 5 | 6 bytes |
+| Order Reference Number | 11 | 8 bytes |
+| **Total message length** | — | **19 bytes** |
+
+All remaining shares for the order are removed. A delete is not a trade
+execution and must not increase executed volume.
+
+## 5.9 Order Replace --- `U`
+
+A `U` message represents a cancel-replace operation. The original order
+is removed and the replacement is identified by a new Order Reference
+Number.
+
+| Field | Offset | Length |
+|---|---:|---:|
+| Message Type | 0 | 1 byte |
+| Stock Locate | 1 | 2 bytes |
+| Tracking Number | 3 | 2 bytes |
+| Timestamp | 5 | 6 bytes |
+| Original Order Reference Number | 11 | 8 bytes |
+| New Order Reference Number | 19 | 8 bytes |
+| Shares | 27 | 4 bytes |
+| Price | 31 | 4 bytes |
+| **Total message length** | — | **35 bytes** |
+
+The side, stock symbol and attribution are inherited from the original
+order. They are not supplied again in the `U` message.
+
+Processing: 1. Find and remove the original order. 2. Create the
+replacement order using the new reference number, new quantity and new
+price. 3. Preserve the original side and other inherited metadata. 4.
+Ensure subsequent updates use the new Order Reference Number.
+
+This is not a simple in-place partial modification: the old reference
+number is replaced by a new reference number.
+
+## 5.10 Trade (Non-Cross) --- `P`
+
+A `P` message reports a trade involving non-displayed order types. It
+does not change the displayed order book.
+
+| Field | Offset | Length |
+|---|---:|---:|
+| Message Type | 0 | 1 byte |
+| Stock Locate | 1 | 2 bytes |
+| Tracking Number | 3 | 2 bytes |
+| Timestamp | 5 | 6 bytes |
+| Order Reference Number | 11 | 8 bytes |
+| Buy/Sell Indicator | 19 | 1 byte |
+| Shares | 20 | 4 bytes |
+| Stock | 24 | 8 bytes |
+| Price | 32 | 4 bytes |
+| Match Number | 36 | 8 bytes |
+| **Total message length** | — | **44 bytes** |
+
+The ITCH 5.0 specification notes that the Order Reference Number is
+populated as zero for this message and that the Buy/Sell Indicator is
+always `B` under the specified effective date. The project must not
+interpret this message as an ordinary displayed-order update.
+
+`P` messages should contribute to trade statistics according to the
+project's defined market-statistics policy.
+
+## 5.11 Cross Trade --- `Q`
+
+A `Q` message reports a cross transaction and contains the instrument,
+shares, cross price, match number and cross type.
+
+It does not represent an ordinary add, cancel or execution against an
+order reference in the displayed order book.
+
+The initial project explicitly excludes `Q` cross-trade volume from its trade analytics. The ARM still recognizes and sequences the 40-byte message. It is not forwarded as a displayed-order update. The message has no effect on the current order book.
+
+## 5.12 Broken Trade --- `B`
+
+A `B` message is 19 bytes long and identifies a previously reported execution that has been broken. Its Match Number refers to a previously transmitted `E`, `C`, or `P` message. A trade break is final and cannot be reinstated.
+
+It does not change the current displayed order book. This project processes it to reverse an included trade-statistics contribution using the ARM-owned Match Number ledger described in Section 6.6.
+
+## 5.13 System Event --- `S`
+
+The `S` message is 12 bytes long and communicates feed or market lifecycle events. Its event code is important for session/day handling.
+
+Common daily event codes include:
+
+| Code | Meaning |
+|---|---|
+| `O` | Start of Messages |
+| `S` | Start of System Hours |
+| `Q` | Start of Market Hours |
+| `M` | End of Market Hours |
+| `E` | End of System Hours |
+| `C` | End of Messages |
+
+The project should use these events to manage feed lifecycle state. The meaning of an event code must not be confused with the one-byte ITCH Message Type field. `E` (End of System Hours) does not mean that all messages for the day have arrived: Nasdaq states that Broken Trade (`B`) and Order Delete (`D`) messages may still follow. Continue processing valid sequenced messages until `C` (End of Messages), which is the final daily ITCH message. This ITCH daily lifecycle is distinct from the MoldUDP64 `Message Count = 0xFFFF` end-of-session marker.
+
+## 5.14 Stock Directory --- `R`
+
+The Stock Directory message maps a current-day Stock Locate value to a symbol and provides instrument attributes. The complete ITCH 5.0 message is 39 bytes.
+
+| Field | Offset | Length | Notes |
+|---|---:|---:|---|
+| Message Type | 0 | 1 | `R` |
+| Stock Locate | 1 | 2 | Current-day locate code |
+| Tracking Number | 3 | 2 | Nasdaq internal tracking field |
+| Timestamp | 5 | 6 | Nanoseconds since midnight |
+| Stock | 11 | 8 | ASCII symbol, right-padded with spaces |
+| Market Category | 19 | 1 | Listing market/category |
+| Financial Status Indicator | 20 | 1 | Financial status code |
+| Round Lot Size | 21 | 4 | Integer |
+| Round Lots Only | 25 | 1 | `Y` or `N` |
+| Issue Classification | 26 | 1 | Classification code |
+| Issue Sub-Type | 27 | 2 | Sub-type code |
+| Authenticity | 29 | 1 | Live/test indicator |
+| Short Sale Threshold Indicator | 30 | 1 | Rule 201 status |
+| IPO Flag | 31 | 1 | IPO status |
+| LULD Reference Price Tier | 32 | 1 | Price-band tier |
+| ETP Flag | 33 | 1 | Exchange-traded product indicator |
+| ETP Leverage Factor | 34 | 4 | Integer |
+| Inverse Indicator | 38 | 1 | Inverse ETP indicator |
+| **Total** | — | **39 bytes** | — |
+
+The ARM must validate the complete message length, extract at least Stock Locate and Stock, and maintain the current-day mapping. The locate value is stable intraday but must not be assumed to remain the same across trading days. Other directory attributes may be retained for host display; they are not required by the initial order-book datapath.
+
+## 5.15 Stock Trading Action --- `H`
+
+The Stock Trading Action message is 25 bytes and communicates the trading state of an instrument.
+
+| Field | Offset | Length | Notes |
+|---|---:|---:|---|
+| Message Type | 0 | 1 | `H` |
+| Stock Locate | 1 | 2 | Instrument locate code |
+| Tracking Number | 3 | 2 | Nasdaq internal tracking field |
+| Timestamp | 5 | 6 | Nanoseconds since midnight |
+| Stock | 11 | 8 | ASCII symbol, right-padded with spaces |
+| Trading State | 19 | 1 | `H`, `P`, `Q`, or `T` |
+| Reserved | 20 | 1 | Reserved by protocol |
+| Reason | 21 | 4 | Trading-action reason code |
+| **Total** | — | **25 bytes** | — |
+
+Trading State values are: `H` = halted, `P` = paused (Nasdaq-listed securities), `Q` = quotation-only period, and `T` = trading on Nasdaq. The ARM tracks the state for the selected instrument and exposes it to the host. The message does not itself add, cancel, or execute displayed orders.
+
+The exact operational policy for host warnings or analytics during a halt/pause is a system-level decision. The order book must continue to reflect sequenced feed events; a trading-state change must not be mistaken for a sequence reset.
+
+------------------------------------------------------------------------
+
+# 6. Message Processing Rules
+
+## 6.1 Feed sequence before instrument filtering
+
+The ARM must process MoldUDP64 framing and sequence continuity for the
+entire feed stream before filtering for the selected instrument.
+
+Reason: the sequence number covers the feed message stream, not only the
+selected instrument. Filtering first would make valid messages for other
+instruments appear to be missing sequence numbers.
+
+## 6.2 Selected-instrument filtering
+
+The initial project supports one active instrument.
+
+The ARM uses the current-day Stock Locate mapping to determine whether a
+parsed message belongs to the selected instrument.
+
+Messages for other instruments are not forwarded to the FPGA, but they
+still count as received feed messages for sequence tracking.
+
+Messages with Stock Locate zero or messages that are not
+instrument-specific must be handled according to their message semantics
+rather than treated as ordinary instrument events.
+
+## 6.3 Order state transitions
+
+The core displayed-order operations are:
+
+| ITCH message | Order-book effect |
+|---|---|
+| `A` / `F` | Create a new order |
+| `E` | Reduce remaining quantity due to execution |
+| `C` | Reduce remaining quantity due to execution at a specified price |
+| `X` | Reduce remaining quantity due to partial cancellation |
+| `D` | Remove all remaining quantity |
+| `U` | Remove old order and create replacement under new reference number |
+| `P` | No displayed-book update |
+| `Q` | No ordinary displayed-order update |
+| `B` | No current displayed-book update |
+
+The order-book engine must preserve the distinction between cancellation
+and execution. Cancellations do not contribute to executed volume.
+
+## 6.4 Trade-statistics policy
+
+The initial trade-statistics inclusion policy is:
+
+| Message | Displayed-book effect | Trade-statistics treatment |
+|---|---|---|
+| `E` | Reduce the referenced resting order | Include the execution. Effective price is obtained from the resting order's stored display price. |
+| `C` with Printable=`Y` | Reduce the referenced resting order | Include using the explicit execution price. |
+| `C` with Printable=`N` | Reduce the referenced resting order | Exclude from ordinary volume/VWAP; the shares are represented in a later bulk print. Retain its Match Number as an excluded ledger entry so a later `B` is recognized. |
+| `P` | No displayed-book update | Include using its explicit price and shares. The Order Reference Number is zero in the specified feed format; the Buy/Sell Indicator is always `B` from the documented effective date and must not be interpreted as the resting-side indicator. |
+| `Q` | No displayed-order update | Exclude from the initial analytics scope. Recognize and sequence the message. |
+| `B` | No displayed-book update | Reverse the original included contribution for the referenced Match Number, if one exists and was included. |
+
+A `B` message refers to a previously transmitted `E`, `C`, or `P` message. It does not refer to a `Q` cross-trade message. A trade break is final and must not be applied twice.
+
+For VWAP, maintain integer accumulators:
+
+- `notional_sum = Σ(price_integer × quantity)` for included trades;
+- `volume_sum = Σ(quantity)` for included trades;
+- `VWAP = notional_sum / volume_sum`, converted to display format only at the host boundary.
+
+A broken trade subtracts the original trade's `price × quantity` and quantity from the corresponding accumulators. Define zero-volume behaviour explicitly in the analytics implementation (for example, report VWAP as unavailable rather than divide by zero).
+
+## 6.5 Integer arithmetic
+
+Prices and quantities must remain integer values in the protocol and FPGA processing path. Any conversion to decimal text or floating-point display values should occur at the host/display boundary, not in the order-book comparison or accumulator logic.
+
+## 6.6 Match Number ledger and broken-trade ordering
+
+The ARM owns a Match Number ledger in DDR. Each entry records at least the Match Number, trading-day/feed context, originating MoldUDP64 session as metadata, source ITCH type, feed sequence, effective price when known, quantity, whether the trade was included in statistics, and whether it has already been broken. The ledger lookup must use the correct Match Number uniqueness scope; the exact scope across a possible MoldUDP64 session transition must be confirmed for the deployed feed.
+
+For included `E` executions, the FPGA resolves the effective price from the referenced resting order and returns a trade-contribution report to the ARM. For included `C` and `P` messages, the price is present in the ITCH message, but the ARM must still associate the ledger entry with successful FPGA processing before treating the contribution as committed. `C` with Printable=`N` is recorded as excluded and does not require an FPGA statistics contribution.
+
+Because AXI4-Stream acceptance (`TVALID && TREADY`) is not proof that the FPGA has completed an event, the ARM must not process a later `B` correction against an incomplete ledger entry. When a `B` is received, the ARM holds that correction until the FPGA's ordered processing-progress indication confirms that all earlier selected-instrument events have been applied and their trade-contribution reports have been delivered. The ARM then looks up the Match Number and, if the original contribution was included, sends a `TRADE_REVERSAL` normalized event containing the original price and quantity. The FPGA subtracts that contribution from the trade accumulators.
+
+If a `B` references a known excluded contribution (for example, `C` with Printable=`N`), mark the ledger entry broken without changing statistics. If the Match Number is unknown, or if an expected contribution report is missing or inconsistent, set `TRADE_STATS_VALID=0`, record the error, and do not invent a reversal amount. `BOOK_VALID` may remain asserted if the order book itself is unaffected. A duplicate `B` must not reverse a contribution twice.
+
+Retain the ledger through the ITCH `S` event code `C` (End of Messages), not merely `E` (End of System Hours). Nasdaq specifies that Broken Trade and Order Delete messages may still arrive after End of System Hours; End of Messages is the final daily message. Archive or persist the ledger before clearing it for the next trading day.
+
+------------------------------------------------------------------------
+
+# 7. Sequence Management
+
+## 7.1 Expected sequence tracking
+
+The ARM maintains: - Active MoldUDP64 session identifier. - Next
+expected message sequence number. - Last contiguous message sequence
+number processed. - Feed-valid state. - Any buffered out-of-order or
+future messages.
+
+Sequence state is scoped to the MoldUDP64 session. A new session must be
+handled as a session transition, not assumed to continue the prior
+session's sequence without feed-specific confirmation.
+
+## 7.2 Normal packet processing
+
+For a packet containing `N` messages: 1. Validate the packet header and
+session. 2. Read the first message sequence number. 3. Walk each
+length-prefixed message block. 4. Assign consecutive sequence numbers to
+messages in the packet. 5. Compare each message sequence with the
+expected sequence. 6. Process only messages that are eligible for
+ordered application. 7. Advance the expected sequence only according to
+the defined contiguous-processing rule.
+
+## 7.3 Sequence gap
+
+A sequence gap means one or more messages expected by the receiver have
+not yet been received.
+
+Example:
+
+``` text
+Expected sequence: 103
+Received sequence: 105
+
+Missing sequence:  103 and 104
+```
+
+The ARM must not silently apply message 105 to the order-book stream
+while 103 and 104 are missing.
+
+Proposed response: 1. Mark the feed as not contiguous. 2. Stop
+forwarding later messages to the FPGA for application. 3. Buffer later
+messages within a bounded recovery buffer where possible. 4. Request the
+missing message range from the configured re-request service. 5.
+Validate and apply recovered messages in sequence. 6. Resume normal
+forwarding only after continuity is restored.
+
+The buffer capacity, request timeout, retry limits and escalation policy
+are implementation parameters to be set and tested. They are not fixed
+by the generic MoldUDP64 packet format.
+
+## 7.4 Duplicate messages
+
+A message whose sequence number has already been accepted for the active
+session must not be applied to the order book a second time.
+
+The receiver should identify duplicates using session and message
+sequence number, not by comparing only the ITCH payload.
+
+## 7.5 Out-of-order arrival
+
+If a message arrives ahead of the next expected sequence number, the
+receiver may buffer it while requesting or waiting for the missing
+range.
+
+It must not apply the later message before the missing earlier messages.
+
+The maximum reorder/recovery window and timeout are project
+configuration items.
+
+## 7.6 Heartbeat processing
+
+A heartbeat has a message count of zero. It carries the next expected
+sequence number.
+
+The receiver should use heartbeat sequence information to detect a gap
+during periods with no ordinary data messages.
+
+## 7.7 Session transition
+
+The receiver must detect changes in the MoldUDP64 session field and
+process end-of-session indications.
+
+A new session requires a defined startup/synchronization procedure. The
+implementation must not assume that the previous in-memory order book
+remains valid for the new session without confirming the feed's recovery
+procedure.
+
+------------------------------------------------------------------------
+
+# 8. Recovery and Snapshot Synchronization
+
+## 8.1 Recovery objective
+
+Recovery must restore a trustworthy order-book state after: - A feed
+sequence gap that cannot be repaired by message re-request. - Receiver
+restart or loss of feed state. - Recovery-buffer overflow. - A detected
+order-book consistency failure. - A session transition requiring a new
+synchronized state.
+
+## 8.2 Incremental retransmission
+
+The first recovery mechanism is to request missing messages from the
+feed's configured re-request service, when those messages remain
+available.
+
+Recovered messages must be checked for: - Correct session. - Correct
+requested sequence range. - Valid MoldUDP64 framing. - Valid message
+lengths. - Correct sequence order.
+
+They must be applied in the correct order and must not be applied twice.
+
+## 8.3 Snapshot recovery
+
+If the missing range is unavailable or incremental recovery cannot
+safely restore continuity, the system requires a feed-supported
+snapshot/recovery mechanism.
+
+The Nasdaq ITCH specification references the GLIMPSE service for
+obtaining current book state in the relevant TotalView-ITCH environment.
+The exact service, snapshot format, entitlement, transport, and
+synchronization rules must be confirmed for the feed used by this
+project.
+
+**Important:** A snapshot must be associated with an unambiguous feed
+synchronization point. The system must know which sequence state is
+already represented by the snapshot and which subsequent messages must
+be applied.
+
+## 8.4 Snapshot cutover rule
+
+The project convention is that the snapshot synchronization sequence denotes the **last feed message already represented by the snapshot**. The first subsequently applied message is therefore `snapshot_sequence + 1`.
+
+This convention is valid only when the actual snapshot/recovery service documents an equivalent sequence boundary. Before implementation, confirm the service's exact cutover semantics. Messages arriving during snapshot acquisition must be buffered and reconciled against that boundary. The FPGA order book remains invalid until the complete snapshot has been loaded, entry count and integrity checks pass, and all required post-snapshot messages have been applied contiguously.
+
+Bulk snapshot loading uses a dedicated snapshot-loading interface or memory region, not the normal event stream. The snapshot transfer must include an expected entry count and integrity value; the ARM and FPGA independently calculate the checksum over an agreed set of fields. The checksum algorithm, field coverage, transfer framing and completion handshake are specified in the hardware/interface design documents.
+
+## 8.5 Book validity
+
+The system should distinguish: - **Feed validity:** Whether the ARM has
+a contiguous, correctly identified feed stream. - **Book validity:**
+Whether the FPGA's order book is known to represent the correct state at
+the current feed position.
+
+A contiguous feed does not automatically prove that the FPGA book is
+correct if an internal processing error occurred.
+
+During recovery, analytics may be retained for diagnostics or display,
+but they must be marked stale/invalid and must not be presented as
+current valid market state.
+
+## 8.6 Recovery limitations
+
+Recovery is feed-specific. This document defines the required behaviour
+at a high level, but the actual snapshot and re-request workflow must be
+verified against the service documentation available for the selected
+feed.
+
+------------------------------------------------------------------------
+
+# 9. ARM--FPGA Normalized Event Interface
+
+## 9.1 Purpose
+
+The ARM parses the external ITCH message format and converts supported
+messages into a project-defined normalized event representation.
+
+This separates external feed details from the FPGA order-book engine.
+
+The FPGA should not need to parse UDP, MoldUDP64 or the original ITCH
+variable-length messages in the initial architecture.
+
+## 9.2 Proposed data path
+
+```text
+UDP multicast
+     |
+     v
+ARM: UDP reception and MoldUDP64 parsing
+     |
+     v
+ARM: feed-wide sequence management and recovery
+     |
+     v
+ARM: ITCH parsing and instrument filtering
+     |
+     v
+ARM: normalized event generation + Match Number ledger
+     |
+     | AXI4-Stream
+     v
+FPGA: order-book engine + trade statistics
+     |
+     +---- trade-contribution reports / processing progress ----> ARM
+```
+
+The ARM performs transport framing, feed sequencing, ITCH parsing, instrument filtering, and normalization. The FPGA does not parse UDP, MoldUDP64, or raw ITCH messages in the initial architecture. The FPGA reports accepted trade contributions so the ARM can maintain the Match Number ledger and process later trade breaks safely.
+
+## 9.3 Normalized event fields
+
+The agreed logical event fields are listed below. The field widths define a 465-bit logical payload; the final bit/byte ordering and exact RTL packing must be frozen in `hardware_architecture.md` before implementation.
+
+| Field | Width | Purpose / validity |
+|---|---:|---|
+| Event type | 8 bits | Project event code. |
+| Order Reference Number | 64 bits | Affected order; zero/unused for event types without a displayed order. |
+| New Order Reference Number | 64 bits | Replacement order ID for `REPLACE`; otherwise zero. |
+| Side | 1 bit | Buy/sell for `ADD`; otherwise event-specific or unused. Encoding must be defined in the interface document. |
+| Price | 32 bits | Display price for `ADD`/`REPLACE`; otherwise zero unless event semantics use it. |
+| Quantity | 32 bits | Add, execute, cancel, replace, trade, or reversal quantity. |
+| Execution price | 32 bits | Explicit execution/trade price for `C`/`P` and original price for `TRADE_REVERSAL`; zero when not applicable. |
+| Match Number | 64 bits | Trade correlation for `E`, `C`, `P`, and `TRADE_REVERSAL`. |
+| Event flags | 8 bits | Includes Printable and event-specific field-valid/eligibility flags; bit definitions remain to be finalized. |
+| Feed sequence number | 64 bits | MoldUDP64 message sequence associated with this event. |
+| Exchange timestamp | 64 bits | Original 48-bit ITCH nanoseconds-since-midnight value, zero-extended. |
+| Internal stream session ID | 32 bits | ARM-owned identifier for the current ARM-to-FPGA stream epoch; distinct from the 10-byte MoldUDP64 session field. |
+| **Total** | **465 bits** | **Logical payload before byte padding.** |
+
+Instrument identifier is omitted because the initial design supports one selected instrument and ARM filters before forwarding. Runtime switching invalidates/reinitializes the stream and assigns a new internal stream session ID. If multiple instruments are later supported concurrently, the event format must be extended with an instrument identifier.
+
+The local ARM receive timestamp is captured separately using the ARM's monotonic clock. It is not included in this 465-bit event payload; it is retained in ARM-side receive/latency telemetry. The exchange timestamp remains the original ITCH nanoseconds-since-midnight value and must not be substituted with local time.
+
+The external MoldUDP64 session identifier is 10 bytes and is owned by the feed protocol. The internal stream session ID is 32 bits and is owned by the ARM–FPGA interface. They are not interchangeable.
+
+## 9.4 Project-defined event codes
+
+| Code | Event | Source / effect |
+|---:|---|---|
+| `0x01` | `ADD` | ITCH `A` or `F`; insert displayed order. |
+| `0x02` | `EXECUTE` | ITCH `E`; reduce order and include trade contribution. |
+| `0x03` | `EXECUTE_WITH_PRICE` | ITCH `C`; reduce order, with Printable flag controlling statistics inclusion. |
+| `0x04` | `CANCEL` | ITCH `X`; reduce remaining displayed quantity. |
+| `0x05` | `DELETE` | ITCH `D`; remove remaining displayed quantity. |
+| `0x06` | `REPLACE` | ITCH `U`; replace old order ID with new order ID. |
+| `0x07` | `TRADE` | ITCH `P`; update trade statistics only. |
+| `0x08` | `TRADE_REVERSAL` | Project event generated from ITCH `B`; reverse a previously included trade contribution. |
+
+These values are project-defined and are not the ASCII ITCH message-type bytes. `Q` is recognized and sequenced by the ARM but is not forwarded as a normal book/trade-statistics event in the initial scope. `S`, `R`, and `H` are handled by the ARM control/state path and host status, not as ordinary order-book events.
+
+## 9.5 AXI4-Stream transfer semantics
+
+The proposed event-data path uses AXI4-Stream.
+
+A transfer is accepted on a clock edge when:
+
+``` text
+TVALID = 1 and TREADY = 1
+```
+
+If `TVALID` is asserted while `TREADY` is low, the producer must keep
+`TVALID` asserted and keep the payload stable until the transfer is
+accepted.
+
+The AXI-Stream handshake confirms that the interface accepted a
+transfer. It does not necessarily mean that the FPGA has completed the
+order-book state update.
+
+The project must therefore define separate processing-status/error reporting where required.
+
+The logical event payload is 465 bits. For the proposed 256-bit AXI4-Stream data width, it is padded to 472 bits (59 bytes) with seven zero padding bits. The transfer uses two beats:
+
+| Beat | Valid bytes | `TKEEP` | `TLAST` |
+|---|---:|---:|---:|
+| 1 | 32 | `0xFFFFFFFF` | `0` |
+| 2 | 27 | `0x07FFFFFF` | `1` |
+
+The five unused byte lanes in the second beat and the seven padding bits must be zero. `TKEEP[26:0]` is asserted and `TKEEP[31:27]` is deasserted on beat 2, so the valid bytes occupy byte lanes 0 through 26. The exact mapping of logical fields to byte lanes and bit positions remains an interface freeze item; the table above fixes the transfer length and valid-byte count. The producer must hold `TVALID`, `TDATA`, `TKEEP`, and `TLAST` stable while stalled (`TREADY=0`).
+
+## 9.6 Control and status path
+
+AXI4-Lite is used for configuration and status, including `FEED_VALID`, `BOOK_VALID`, `TRADE_STATS_VALID`, recovery state, error status, and performance counters. The detailed register map, interrupt topology, and diagnostic subsystem implementation belong in the hardware architecture document.
+
+`FEED_VALID` is owned by the ARM because it knows whether the feed session and sequence are contiguous. `BOOK_VALID` is owned by the FPGA because it knows whether all accepted events have been applied consistently. `TRADE_STATS_VALID` is tracked separately because a trade-ledger or broken-trade problem can invalidate statistics without necessarily invalidating the displayed order book.
+
+## 9.7 Event ordering and processing reports
+
+The ARM preserves the order of selected-instrument events. The FPGA applies them in that same order; no later event may overtake an earlier event.
+
+The AXI-Stream handshake confirms transfer acceptance only. The FPGA therefore provides a separate ordered processing-progress indication and a trade-contribution report path to the ARM. A trade-contribution report includes at least feed sequence, Match Number, effective price, quantity, and processing result. For an `E` event, the FPGA obtains the effective price from the order entry before applying the execution.
+
+The ARM may stream ordinary events continuously. When it receives a `B` message, it must hold the correction and stop forwarding later selected-instrument events until the processing-progress indication confirms that all preceding selected-instrument events have completed and all corresponding trade-contribution reports have been delivered. The ARM may continue receiving feed datagrams, but must buffer subsequent events within a bounded queue. It then resolves the Match Number in its DDR ledger and sends a `TRADE_REVERSAL` event only when the original contribution was included. Later selected-instrument events resume only after the reversal has been accepted and its processing result is known. This barrier prevents an asynchronous FPGA report from arriving after the ARM has already tried to reverse the trade.
+
+The precise report-channel encoding, queue depth, progress-watermark semantics, timeout behaviour, and backpressure handling are interface-design items for `hardware_architecture.md`.
+
+------------------------------------------------------------------------
+
+# 10. Error Handling
+
+## 10.1 Error categories
+
+The implementation should distinguish errors by where they occur.
+
+| Category | Example | Responsible area |
+|---|---|---|
+| Network/transport | UDP datagram loss | Network/ARM receive path |
+| MoldUDP64 framing | Invalid message count or truncated message block | ARM protocol parser |
+| Sequence | Missing or duplicate message sequence | ARM sequence manager |
+| ITCH parsing | Unsupported type, invalid length, or invalid field encoding | ARM ITCH parser |
+| Instrument mapping | Unknown or stale Stock Locate mapping | ARM instrument directory/filter |
+| Normalized interface | Invalid event code or malformed normalized event | ARM–FPGA interface |
+| Order-book consistency | Unknown order on cancel/execute, duplicate add, or impossible quantity transition | FPGA order-book engine |
+| Recovery | Snapshot mismatch or recovery timeout | ARM recovery coordinator and FPGA state |
+
+## 10.2 Malformed MoldUDP64 packet
+
+The ARM validates the complete downstream datagram before forwarding any message from it. Validation includes the fixed header, message count, every two-byte message-length field, each complete message block, and exact consumption of the datagram payload.
+
+If any part is malformed or truncated, reject the entire datagram; do not forward earlier message blocks from that same datagram. Record the session, packet starting sequence, declared message count, and failure reason where available. Do not parse beyond the validated packet boundary. Reconcile the affected sequence range using subsequent packets/heartbeats and the configured recovery service; mark `FEED_VALID=0` and `BOOK_VALID=0` whenever continuity cannot be proven.
+
+## 10.3 Unsupported ITCH message
+
+If a message type is on the explicitly recognized skip list (`Y`, `L`, `V`, `W`, `J`, `K`, `I`, `N`) and its MoldUDP64 message boundary and expected ITCH length are valid, preserve feed sequence accounting and skip forwarding it to the FPGA.
+
+For an unknown message type, stop forwarding later events, record the type and sequence, and mark the feed as untrusted. Because the unknown message may alter order-book state, conservatively clear `BOOK_VALID` until its semantics are understood and a recovery/snapshot establishes a trustworthy state. A known, correctly framed skip-list message is not itself a sequence gap.
+
+If any message boundary or length is not trustworthy, reject the entire malformed MoldUDP64 datagram before forwarding any message from it. Do not parse beyond validated packet boundaries. Enter recovery if continuity or message integrity can no longer be established.
+
+## 10.4 Invalid order-book operation
+
+Examples include: - ADD for an order reference that already exists. -
+CANCEL for an unknown order. - EXECUTE for an unknown order. -
+Cancellation or execution quantity greater than the known remaining
+quantity. - REPLACE for an unknown original order.
+
+The FPGA must not perform a state update that would create an invalid
+quantity or corrupt the book.
+
+The initial policy is: 1. Reject the invalid state transition. 2.
+Preserve the current order-book contents. 3. Report the error and
+associated event context. 4. Determine whether the event indicates
+feed/parser corruption, lost event history, or an FPGA implementation
+defect. 5. Mark the book invalid and initiate recovery if the
+correctness of the reconstructed state can no longer be guaranteed.
+
+An invalid order-book transition is not automatically a network sequence gap. The FPGA rejects the state transition, preserves the last known state for diagnostics, reports the event context, and clears `BOOK_VALID` whenever correctness of the reconstructed state can no longer be guaranteed. The ARM then coordinates recovery. The implementation must classify errors rather than treating every unknown-order condition as packet loss.
+
+## 10.5 Error reporting
+
+At minimum, the system should make it possible to identify: - Error
+category and code. - Associated feed sequence number, when available. -
+Associated order reference number, when available. - Whether the feed is
+valid. - Whether the book is valid. - Whether trade statistics are valid. - Whether recovery is in progress.
+
+The physical diagnostic transport, interrupt structure and register
+allocation are implementation details for the hardware architecture
+document.
+
+------------------------------------------------------------------------
+
+# 11. Instrument Selection and Switching
+
+## 11.1 Initial single-instrument mode
+
+The initial system supports one active instrument.
+
+The ARM resolves the selected symbol using the current day's Stock
+Directory information and filters messages using the corresponding Stock
+Locate value.
+
+Sequence tracking remains global to the received feed stream and must
+not be limited to the selected instrument.
+
+## 11.2 Runtime instrument switching
+
+Runtime instrument switching is supported only as a controlled restart/reconstruction operation:
+
+1. Stop forwarding events for the old instrument.
+2. Mark `BOOK_VALID=0` and make the old book unavailable as current state.
+3. Resolve the new instrument's current-day Stock Locate value from `R` messages.
+4. Start a new internal ARM–FPGA stream session ID.
+5. Obtain a feed-supported synchronized starting state for the new instrument.
+6. Load the snapshot or otherwise reconstruct the new book, then apply subsequent selected-instrument events in the correct sequence.
+7. Set `BOOK_VALID=1` only after synchronization and contiguous application complete.
+
+Feed-wide MoldUDP64 sequence tracking continues throughout the switch; it is not reset merely because the selected instrument changes. If the actual feed/snapshot service cannot provide a safe synchronization point, switching must be implemented as a full controlled restart rather than an unsynchronized in-place change.
+
+------------------------------------------------------------------------
+
+# 12. Verification Requirements
+
+The protocol implementation must be verified independently at the ARM
+parser, normalized interface and FPGA event-processing boundaries.
+
+## 12.1 MoldUDP64 test cases
+
+At minimum, test: - Valid packet with one message. - Valid packet with
+multiple messages. - Correct message-length parsing. - Heartbeat packet
+with message count zero. - End-of-session packet. - Sequence gap. -
+Duplicate sequence. - Out-of-order packet/message arrival. - Re-request
+response. - Wrong or unexpected session. - Truncated header. - Truncated
+message block. - Invalid message count or inconsistent packet length.
+
+## 12.2 ITCH parser test cases
+
+At minimum, test: - Valid `S`, `R`, `H`, `A`, `F`, `E`, `C`, `X`, `D`, `U`, `P`, `Q`, and `B` messages. - Correct field offsets and lengths, including `R` (39 bytes) and `H` (25 bytes). - Big-endian
+decoding. - ASCII and space-padded fields. - Price scaling. -
+Nanoseconds-since-midnight timestamp decoding. - Unsupported message
+type. - Invalid message length. - Boundary values for quantity, price
+and order reference fields.
+
+## 12.3 Order-book event test cases
+
+At minimum, test: - Add buy order. - Add sell order. - Partial cancel. -
+Full delete. - Partial execution. - Full execution. - Execution with a
+different execution price. - Non-printable execution handling. - Order
+replacement and new order reference number. - Non-displayed `P` trade that must not modify the displayed book but must update eligible statistics. - `Q` recognition without inclusion in initial statistics. - `B` reversal for prior `E`, printable `C`, and `P` contributions. - `B` for excluded non-printable `C`, duplicate `B`, unknown Match Number, and `B` arriving before the FPGA trade report is committed. - Unknown order
+reference. - Duplicate add. - Quantity underflow attempt. - Correct best
+bid and best ask after each event.
+
+## 12.4 Sequence and recovery test cases
+
+At minimum, test: - Normal contiguous feed. - Missing sequence followed
+by successful re-request. - Missing sequence unavailable for
+retransmission. - Buffer limit reached. - Snapshot recovery. - Snapshot
+synchronization boundary. - Duplicate recovered message. - Session
+transition. - ARM restart or receiver state loss. - Book remains invalid
+until synchronization is complete.
+
+## 12.5 ARM--FPGA interface test cases
+
+At minimum, test: - Correct normalized event encoding and padding. - Correct sequence and internal stream-session preservation. - Two-beat 256-bit AXI4-Stream framing, `TKEEP`, and `TLAST`. - `TVALID`/`TREADY` handshake and stable payload during backpressure. - No event reordering. - Invalid event code. - FPGA processing error reporting. - Ordered processing-progress reporting. - Trade-contribution reports for `E`, `C(Y)`, and `P`. - `B` barrier and reversal ordering. - Independent `FEED_VALID`, `BOOK_VALID`, and `TRADE_STATS_VALID` transitions.
+
+## 12.6 Reference-model comparison
+
+A software reference model should process the same ordered
+normalized-event stream as the FPGA.
+
+After each event or selected checkpoint, compare: - Active order
+count. - Per-order remaining quantity. - Best bid. - Best ask. -
+Spread. - Selected market-depth values. - Trade statistics, if
+enabled. - Book-validity state.
+
+The software model is a verification reference, not the production
+source of truth.
+
+------------------------------------------------------------------------
+
+# 13. Open Items and Assumptions
+
+The following items remain open after consolidation. They are not silently assumed to be solved by the protocol standards.
+
+| ID | Open item | Required follow-up |
+|---|---|---|
+| OI-01 | Exact feed product and service configuration | Confirm multicast groups, ports, re-request servers, entitlement, maximum packet size, request limits, and retention window with the actual provider. |
+| OI-02 | Snapshot/recovery service | Confirm whether GLIMPSE or another service is available, its snapshot format, synchronization marker semantics, and cutover procedure. |
+| OI-03 | Recovery buffering and timeout parameters | Select buffer capacity, reorder window, timeout, retry policy, and snapshot escalation behaviour from measured traffic and service limits. |
+| OI-04 | Normalized-event packing | Freeze field bit order, byte order, field offsets, flag definitions, reserved-bit values, and exact `TKEEP`/`TLAST` framing in `hardware_architecture.md`. |
+| OI-05 | Processing-report interface | Define report queue depth, report encoding, sequence-progress watermark, timeout, and the precise `B` barrier protocol. |
+| OI-06 | Match Number ledger capacity, uniqueness scope, and persistence | Confirm Match Number uniqueness scope across feed-session transitions; size the DDR hash table; define collision handling, retention, archival, restart persistence, and daily rollover. |
+| OI-07 | Snapshot transfer interface | Define snapshot entry layout, loading protocol, checksum algorithm/coverage, completion signalling, and interaction with normal event ingress. |
+| OI-08 | Trade-statistics scope | Confirm whether additional analytics beyond cumulative volume and VWAP are required, including rolling windows and any separate cross-volume metric. |
+| OI-09 | Timestamp and latency measurement | Define ARM monotonic clock source, timestamp capture point, clock synchronization assumptions, and how exchange/local timestamps are compared. |
+| OI-10 | Isolated FPGA state-error policy | Finalize which detected order-book errors always invalidate the book and which can be safely rejected without further state loss. |
+| OI-11 | Runtime switch behaviour | Verify that the selected feed's snapshot/recovery service can support synchronized instrument switching; otherwise require a full controlled restart. |
+| OI-12 | Unknown message policy | Maintain an explicit versioned list of recognized-but-skipped message types and update it when the selected feed specification changes. |
+
+------------------------------------------------------------------------
+
+# 14. References
+
+The official specifications take precedence over this project's summaries if a discrepancy is found.
+
+1. Nasdaq, **TotalView-ITCH 5.0 Interface Specification**: https://www.nasdaqtrader.com/content/technicalsupport/specifications/dataproducts/NQTVITCHSpecification_5.0.pdf
+2. Nasdaq, **MoldUDP64 Protocol Specification, Version 1.00**: https://nasdaqtrader.com/content/technicalsupport/specifications/dataproducts/moldudp64.pdf
+3. AMD/Xilinx AXI4-Stream, Zynq-7000, and 7-series documentation: consult the documents matching the selected Vivado release and Zynq-7020 device when the hardware interface is frozen.
+
+------------------------------------------------------------------------
+
+# Appendix A --- Worked MoldUDP64 Example
+
+Assume a downstream packet contains three ITCH messages and the packet
+header sequence number is 500.
+
+| Message block | ITCH message | MoldUDP64 sequence |
+|---:|---|---:|
+| 1 | Add Order (`A`) | 500 |
+| 2 | Order Cancel (`X`) | 501 |
+| 3 | Order Executed (`E`) | 502 |
+
+The receiver: 1. Reads the MoldUDP64 header. 2. Sees that the first
+message sequence is 500. 3. Reads the first two-byte message length and
+extracts the first ITCH message. 4. Assigns sequence 500 to that
+message. 5. Repeats for the next message blocks, assigning 501 and 502.
+6. Verifies that the message count and packet boundaries are consistent.
+7. Processes the messages in sequence order.
+
+The sequence numbers are supplied by MoldUDP64 framing; they are not
+embedded in the ITCH messages.
+
+# Appendix B --- Worked Order-Book Example
+
+Assume the selected instrument receives these normalized events in
+order:
+
+| Sequence | Event | Order ID | Side | Price | Quantity |
+|---:|---|---:|---|---:|---:|
+| 100 | ADD | 1001 | BUY | 100.5000 | 200 |
+| 101 | ADD | 1002 | SELL | 100.7000 | 150 |
+| 102 | CANCEL | 1001 | — | — | 50 |
+| 103 | EXECUTE | 1002 | — | — | 50 |
+
+Expected remaining orders after processing:
+
+| Order ID | Side | Price | Remaining quantity |
+|---:|---|---:|---:|
+| 1001 | BUY | 100.5000 | 150 |
+| 1002 | SELL | 100.7000 | 100 |
+
+Expected top of book:
+
+| Metric | Expected value |
+|---|---:|
+| Best Bid | 100.5000 |
+| Best Ask | 100.7000 |
+| Spread | 0.2000 |
+
+The example is illustrative. A complete test vector must include the
+exact binary ITCH message bytes and MoldUDP64 packet framing.
+
+------------------------------------------------------------------------
+
+**End of document --- Version 0.3**
